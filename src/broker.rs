@@ -66,7 +66,7 @@ async fn handle(
                 group,
                 policies,
             } => {
-                let submit = match make_submit(cwd, argv, key, group, policies) {
+                let (submit, scope_settings) = match make_submit(cwd, argv, key, group, policies) {
                     Ok(x) => x,
                     Err(e) => {
                         let _ = out.send(BrokerMessage::Error {
@@ -77,6 +77,13 @@ async fn handle(
                 };
                 let (result, effects) = {
                     let mut a = app.lock().await;
+                    let scope = PolicyScopeId::for_key(&submit.key, submit.group.clone());
+                    a.configure_scope_patch(
+                        scope,
+                        scope_settings.contention,
+                        scope_settings.max_concurrency,
+                        scope_settings.rate_limit,
+                    );
                     let r = a.submit(Duration::ZERO, submit);
                     (r, a.take_effects())
                 };
@@ -143,35 +150,70 @@ async fn handle(
     writer_task.abort();
 }
 
+struct ScopeSettings {
+    contention: Option<crate::domain::ContentionMode>,
+    max_concurrency: Option<Option<usize>>,
+    rate_limit: Option<Option<RateLimit>>,
+}
+
 fn make_submit(
     cwd: String,
     argv: Vec<String>,
     key: Option<String>,
     group: Option<String>,
     p: SubmitPolicies,
-) -> Result<SubmitRequest> {
+) -> Result<(SubmitRequest, ScopeSettings)> {
     if cwd.is_empty() || argv.first().is_none_or(String::is_empty) {
         anyhow::bail!("invalid submit command");
     }
     let key = Key(key.unwrap_or_else(|| format!("{cwd}\0{}", argv.join("\0"))));
-    Ok(SubmitRequest {
-        key,
-        group: group.map(GroupId),
-        definition: ExecutionDefinition {
-            command: DomainCommand {
-                executable: argv[0].clone(),
-                arguments: argv[1..].to_vec(),
-                working_directory: Some(cwd),
+    let scope_settings = ScopeSettings {
+        contention: p.contention.map(|value| match value {
+            protocol::ContentionMode::Reuse => crate::domain::ContentionMode::Reuse,
+            protocol::ContentionMode::Queue => crate::domain::ContentionMode::Queue,
+            protocol::ContentionMode::Latest => crate::domain::ContentionMode::Latest,
+            protocol::ContentionMode::Drop => crate::domain::ContentionMode::Drop,
+            protocol::ContentionMode::Replace => crate::domain::ContentionMode::Replace,
+        }),
+        max_concurrency: p.max_concurrency.map(Some),
+        rate_limit: p.rate_limit.map(|rate| {
+            Some(RateLimit {
+                max_starts: rate.max_starts,
+                per: Duration::from_millis(rate.per_ms),
+            })
+        }),
+    };
+    Ok((
+        SubmitRequest {
+            key,
+            group: group.map(GroupId),
+            definition: ExecutionDefinition {
+                command: DomainCommand {
+                    executable: argv[0].clone(),
+                    arguments: argv[1..].to_vec(),
+                    working_directory: Some(cwd),
+                },
+                retry: RetryPolicy {
+                    limit: p.retry_limit,
+                    retry_on: p.retry_on.map(|codes| codes.into_iter().collect()),
+                    no_retry_on: p.no_retry_on.into_iter().collect(),
+                    delay: Duration::from_millis(p.retry_delay_ms.unwrap_or(0)),
+                    backoff: match p.retry_backoff {
+                        protocol::RetryBackoff::Fixed => crate::domain::RetryBackoff::Fixed,
+                        protocol::RetryBackoff::Exponential => {
+                            crate::domain::RetryBackoff::Exponential
+                        }
+                    },
+                    jitter_basis_points: p.retry_jitter_basis_points,
+                    ..Default::default()
+                },
+                attempt_timeout: p.attempt_timeout_ms.map(Duration::from_millis),
+                kill_grace: Duration::from_millis(p.kill_grace_ms.unwrap_or(1000)),
+                unobserved_grace: p.unobserved_grace_ms.map(Duration::from_millis),
             },
-            retry: RetryPolicy {
-                limit: p.retry_limit,
-                ..Default::default()
-            },
-            attempt_timeout: p.attempt_timeout_ms.map(Duration::from_millis),
-            kill_grace: Duration::from_millis(p.kill_grace_ms.unwrap_or(1000)),
-            unobserved_grace: p.unobserved_grace_ms.map(Duration::from_millis),
         },
-    })
+        scope_settings,
+    ))
 }
 async fn detach(app: &Arc<Mutex<Application>>, subs: &Subscribers, id: SubscriptionId) {
     app.lock().await.disconnect(Duration::ZERO, id);

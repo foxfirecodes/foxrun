@@ -106,13 +106,56 @@ pub struct SubmitRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SubmitPolicies {
+    /// Scope-wide contention and admission settings. `None` means leave the
+    /// scope's existing setting alone (rather than silently resetting a group).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contention: Option<ContentionMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<WireRateLimit>,
     pub retry_limit: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_on: Option<Vec<i32>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub no_retry_on: Vec<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_delay_ms: Option<u64>,
+    #[serde(default)]
+    pub retry_backoff: RetryBackoff,
+    #[serde(default)]
+    pub retry_jitter_basis_points: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt_timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kill_grace_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unobserved_grace_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireRateLimit {
+    pub max_starts: usize,
+    pub per_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentionMode {
+    Reuse,
+    Queue,
+    Latest,
+    Drop,
+    Replace,
+}
+
+/// How retry delay changes after each failed attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryBackoff {
+    #[default]
+    Fixed,
+    Exponential,
 }
 
 /// Which command output stream produced a chunk.

@@ -126,6 +126,30 @@ impl Application {
             .configure(&id, policy)
             .expect("scope was ensured");
     }
+    /// Applies only the scope settings explicitly supplied by a client. This
+    /// prevents a later bare submission from resetting an established group.
+    pub fn configure_scope_patch(
+        &mut self,
+        id: PolicyScopeId,
+        contention: Option<ContentionMode>,
+        max_concurrency: Option<Option<usize>>,
+        rate_limit: Option<Option<RateLimit>>,
+    ) {
+        self.scopes.ensure_scope(id.clone());
+        let mut policy = self.scopes.policy(&id).expect("scope was ensured").clone();
+        if let Some(value) = contention {
+            policy.contention = value;
+        }
+        if let Some(value) = max_concurrency {
+            policy.admission.max_concurrency = value;
+        }
+        if let Some(value) = rate_limit {
+            policy.admission.rate_limit = value;
+        }
+        self.scopes
+            .configure(&id, policy)
+            .expect("scope was ensured");
+    }
     pub fn request_state(&self, id: RequestId) -> Option<RequestState> {
         self.requests.get(id).map(|r| r.state)
     }

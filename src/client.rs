@@ -13,39 +13,79 @@ use tokio::net::UnixStream;
 use tokio::time::{Instant, sleep};
 
 use crate::protocol::{
-    BrokerMessage, ClientMessage, LifecycleEventKind, OutputStream, ProtocolError, SubmitPolicies,
-    WireOutcome, decode_output, read_frame, write_frame,
+    BrokerMessage, ClientMessage, LifecycleEventKind, OutputStream, ProtocolError, RetryBackoff,
+    SubmitPolicies, WireOutcome, decode_output, read_frame, write_frame,
 };
 
 const STARTUP_DEADLINE: Duration = Duration::from_secs(2);
 const RETRY_DELAY: Duration = Duration::from_millis(25);
 
-#[derive(Debug)]
-pub struct ClientOptions {
+#[derive(Debug, Clone)]
+pub struct SubmitOptions {
     pub cwd: Option<PathBuf>,
     pub argv: Vec<String>,
-    pub tail_lines: usize,
-    pub broker_timeout: Duration,
+    pub key: Option<String>,
+    pub group: Option<String>,
+    pub contention: Option<crate::protocol::ContentionMode>,
+    pub max_concurrency: Option<usize>,
+    pub rate_limit: Option<crate::protocol::WireRateLimit>,
+    pub retry_limit: u32,
+    pub retry_on: Option<Vec<i32>>,
+    pub no_retry_on: Vec<i32>,
+    pub retry_delay: Option<Duration>,
+    pub retry_backoff_exponential: bool,
+    pub retry_jitter_basis_points: u16,
+    pub attempt_timeout: Option<Duration>,
+    pub kill_grace: Duration,
+    pub unobserved_grace: Option<Duration>,
+    pub json: bool,
 }
 
-pub async fn run(options: ClientOptions) -> Result<()> {
+/// Submit a request without making the submitting connection its observer.
+/// The IDs printed here are the handles for later subscription and cancellation.
+pub async fn submit(options: SubmitOptions) -> Result<()> {
+    let (request_id, execution_id) = submit_request(options).await?;
+    println!("request_id={request_id}");
+    if let Some(execution_id) = execution_id {
+        println!("execution_id={execution_id}");
+    }
+    Ok(())
+}
+
+/// The primary CLI behavior: submit and remain subscribed until the request
+/// reaches a terminal outcome. The socket is observation, not process ownership.
+pub async fn run(options: SubmitOptions) -> Result<()> {
+    let (request_id, _) = submit_request(options.clone()).await?;
+    subscribe_with_format(request_id, None, options.json).await
+}
+
+async fn submit_request(options: SubmitOptions) -> Result<(String, Option<String>)> {
     let cwd = canonical_directory(options.cwd.as_deref())?;
     let runtime_dir = runtime_dir()?;
     let socket = runtime_dir.join("broker.sock");
     check_socket_path(&socket)?;
-    let unobserved_grace_ms = options
-        .broker_timeout
-        .as_millis()
-        .try_into()
-        .map_err(|_| anyhow!("--broker-timeout is too large"))?;
     let submit = ClientMessage::Submit {
         cwd: cwd.to_string_lossy().into_owned(),
         argv: options.argv,
-        key: None,
-        group: None,
+        key: options.key,
+        group: options.group,
         policies: SubmitPolicies {
-            unobserved_grace_ms: Some(unobserved_grace_ms),
-            ..SubmitPolicies::default()
+            contention: options.contention,
+            max_concurrency: options.max_concurrency,
+            rate_limit: options.rate_limit,
+            retry_limit: options.retry_limit,
+            retry_on: options.retry_on,
+            no_retry_on: options.no_retry_on,
+            retry_delay_ms: options.retry_delay.map(duration_millis).transpose()?,
+            retry_backoff: if options.retry_backoff_exponential {
+                RetryBackoff::Exponential
+            } else {
+                RetryBackoff::Fixed
+            },
+            retry_jitter_basis_points: options.retry_jitter_basis_points,
+            attempt_timeout_ms: options.attempt_timeout.map(duration_millis).transpose()?,
+            kill_grace_ms: Some(duration_millis(options.kill_grace)?),
+            unobserved_grace_ms: options.unobserved_grace.map(duration_millis).transpose()?,
         },
     };
     let deadline = Instant::now() + STARTUP_DEADLINE;
@@ -53,8 +93,13 @@ pub async fn run(options: ClientOptions) -> Result<()> {
 
     loop {
         let mut stream = connect_or_start(&runtime_dir, &socket).await?;
-        match send_submit_and_subscribe(&mut stream, &submit).await? {
-            SubmitResult::Subscribed => return stream_messages(&mut stream).await,
+        match send_submit(&mut stream, &submit).await? {
+            SubmitResult::Submitted {
+                request_id,
+                execution_id,
+            } => {
+                return Ok((request_id, execution_id));
+            }
             SubmitResult::ConnectionClosed(error) => {
                 last_error = Some(error);
                 if Instant::now() >= deadline {
@@ -70,17 +115,70 @@ pub async fn run(options: ClientOptions) -> Result<()> {
     }
 }
 
+pub async fn subscribe(request_id: String, after: Option<u64>) -> Result<()> {
+    subscribe_with_format(request_id, after, false).await
+}
+
+async fn subscribe_with_format(request_id: String, after: Option<u64>, json: bool) -> Result<()> {
+    let mut stream = connect_existing().await?;
+    write_frame(&mut stream, &ClientMessage::Subscribe { request_id, after })
+        .await
+        .context("could not subscribe to request")?;
+    match read_frame::<_, BrokerMessage>(&mut stream).await? {
+        BrokerMessage::Subscribed { .. } => stream_messages(&mut stream, json).await,
+        BrokerMessage::Error { message } => bail!("broker: {message}"),
+        message => bail!("broker sent {message:?} before subscription acknowledgement"),
+    }
+}
+
+pub async fn cancel(request_id: String) -> Result<()> {
+    let mut stream = connect_existing().await?;
+    write_frame(
+        &mut stream,
+        &ClientMessage::CancelRequest {
+            request_id: request_id.clone(),
+        },
+    )
+    .await
+    .context("could not cancel request")?;
+    match read_frame::<_, BrokerMessage>(&mut stream).await? {
+        BrokerMessage::Cancelled {
+            request_id: cancelled,
+        } => {
+            println!("cancelled_request_id={cancelled}");
+            Ok(())
+        }
+        BrokerMessage::Error { message } => bail!("broker: {message}"),
+        message => bail!("broker sent {message:?} before cancellation acknowledgement"),
+    }
+}
+
+fn duration_millis(value: Duration) -> Result<u64> {
+    value
+        .as_millis()
+        .try_into()
+        .map_err(|_| anyhow!("duration is too large"))
+}
+
+async fn connect_existing() -> Result<UnixStream> {
+    let socket = runtime_dir()?.join("broker.sock");
+    check_socket_path(&socket)?;
+    UnixStream::connect(&socket)
+        .await
+        .with_context(|| format!("could not connect to broker at {}", socket.display()))
+}
+
 enum SubmitResult {
-    Subscribed,
+    Submitted {
+        request_id: String,
+        execution_id: Option<String>,
+    },
     /// The broker can close a just-established connection while it exits. No
     /// acquire was acknowledged, so it is safe to connect again.
     ConnectionClosed(ProtocolError),
 }
 
-async fn send_submit_and_subscribe<S>(
-    stream: &mut S,
-    submit: &ClientMessage,
-) -> Result<SubmitResult>
+async fn send_submit<S>(stream: &mut S, submit: &ClientMessage) -> Result<SubmitResult>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -94,26 +192,13 @@ where
     }
 
     match read_frame::<_, BrokerMessage>(stream).await {
-        Ok(BrokerMessage::Submitted { request_id, .. }) => {
-            write_frame(
-                stream,
-                &ClientMessage::Subscribe {
-                    request_id,
-                    after: None,
-                },
-            )
-            .await
-            .context("could not subscribe to submitted request")?;
-            match read_frame::<_, BrokerMessage>(stream).await {
-                Ok(BrokerMessage::Subscribed { .. }) => Ok(SubmitResult::Subscribed),
-                Ok(BrokerMessage::Error { message }) => bail!("broker: {message}"),
-                Ok(message) => bail!("broker sent {message:?} before subscription acknowledgement"),
-                Err(ProtocolError::Io(error)) => {
-                    Ok(SubmitResult::ConnectionClosed(ProtocolError::Io(error)))
-                }
-                Err(error) => Err(error).context("broker sent an invalid subscription response"),
-            }
-        }
+        Ok(BrokerMessage::Submitted {
+            request_id,
+            execution_id,
+        }) => Ok(SubmitResult::Submitted {
+            request_id,
+            execution_id,
+        }),
         Ok(BrokerMessage::Error { message }) => bail!("broker: {message}"),
         Ok(message) => bail!("broker sent {message:?} before submit acknowledgement"),
         Err(ProtocolError::Io(error)) => {
@@ -234,7 +319,7 @@ fn spawn_broker(runtime_dir: &Path, socket: &Path) -> Result<()> {
         .context("could not duplicate broker log handle")?;
     let mut command = Command::new(executable);
     command
-        .arg("broker")
+        .arg("--broker")
         .arg("--socket")
         .arg(socket)
         .stdin(Stdio::null())
@@ -271,7 +356,7 @@ async fn wait_for_broker(socket: &Path) -> Result<UnixStream> {
     ))
 }
 
-async fn stream_messages(stream: &mut UnixStream) -> Result<()> {
+async fn stream_messages(stream: &mut UnixStream, json: bool) -> Result<()> {
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
@@ -280,7 +365,11 @@ async fn stream_messages(stream: &mut UnixStream) -> Result<()> {
             result = read_frame::<_, BrokerMessage>(stream) => {
                 let message = result.context("broker connection closed unexpectedly")?;
                 match message {
-                    BrokerMessage::Event { event } => match event.kind {
+                    BrokerMessage::Event { event } => {
+                    if json {
+                        println!("{}", serde_json::to_string(&event).context("could not encode lifecycle event")?);
+                    }
+                    match event.kind {
                     LifecycleEventKind::Output { stream, data_base64, .. } => {
                         let data = decode_output(&data_base64)
                             .context("broker sent invalid output encoding")?;
@@ -296,7 +385,7 @@ async fn stream_messages(stream: &mut UnixStream) -> Result<()> {
                     },
                     LifecycleEventKind::RequestCompleted { outcome } => std::process::exit(outcome_status(outcome)),
                     _ => {},
-                    },
+                    }},
                     BrokerMessage::Submitted { .. } | BrokerMessage::Subscribed { .. } | BrokerMessage::Cancelled { .. } | BrokerMessage::Unsubscribed { .. } => {},
                     BrokerMessage::Error { message } => bail!("broker: {message}"),
                 }
@@ -371,9 +460,7 @@ mod tests {
         };
 
         assert!(matches!(
-            send_submit_and_subscribe(&mut stream, &submit)
-                .await
-                .unwrap(),
+            send_submit(&mut stream, &submit).await.unwrap(),
             SubmitResult::ConnectionClosed(ProtocolError::Io(_))
         ));
         server.await.unwrap();
