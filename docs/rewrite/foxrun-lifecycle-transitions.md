@@ -132,6 +132,9 @@ A Request:
 
 A Request being superseded does not imply that an already-running Execution must be cancelled unless the configured contention policy explicitly requires replacement.
 
+Client disconnection is not a Request transition. It removes a subscription only; the
+Request remains in its current lifecycle state.
+
 ---
 
 # Execution Lifecycle
@@ -548,11 +551,25 @@ but must only succeed if the Key still references that same Execution.
 
 This compare-by-ID rule protects against races involving replacement or delayed completion handling.
 
+A Key has at most one nonterminal Execution. The Policy Scope scheduler may therefore
+admit concurrent work only for different Keys.
+
+Pending Requests are not Key state. They are owned by the Key's Policy Scope, which may
+maintain Key-aware indexes to apply same-Key contention behavior.
+
 ---
 
 # Pending Work Lifecycle
 
 Pending status belongs to Requests, but the scheduling semantics deserve their own transition model.
+
+Each pending Request belongs to the pending-work set of its Policy Scope. The Scope may
+index that set by Key to apply same-Key contention behavior, but a Key never owns a
+separate queue.
+
+The Scope selects the **oldest runnable request**: the earliest received Request whose
+Key has no nonterminal Execution. An older Request for an active Key does not prevent a
+later runnable Request for a different Key from using available Group capacity.
 
 A pending Request may be:
 
@@ -610,41 +627,34 @@ No Execution lifecycle transition occurs.
 
 ---
 
-## FIFO
-
-If fresh work is admissible:
-
-```
-Request: Received → Assigned
-new Execution: Created → Running
-```
-
-If not:
+## Queue
 
 ```
 Request: Received → Pending
 ```
 
-Existing pending Requests remain unchanged.
+The Policy Scope scheduler subsequently selects this Request for Admission:
+
+```
+Request: Pending → Assigned
+new Execution: Created → Running
+```
+
+The Request may be selected immediately when capacity permits, but it still enters the
+Policy Scope's pending-work set first. This prevents a newly received Request from
+bypassing pending work in the same Scope.
 
 ---
 
 ## Latest
 
-If fresh work is admissible and there is no reason to wait:
-
-```
-Request: Received → Assigned
-new Execution: Created → Running
-```
-
-If blocked and no Request is currently pending:
+If no pending Request exists for the same Key:
 
 ```
 Request: Received → Pending
 ```
 
-If blocked and old Request P is pending:
+If an old Request P is pending for the same Key:
 
 ```
 P: Pending → Superseded
@@ -683,6 +693,10 @@ R: Received → Pending
 ```
 
 Once E reaches `Cancelled` and releases its Admission Permit, R is reconsidered normally.
+
+Requests already Attached or Assigned to E remain attached to E. They complete as
+`Cancelled` with replacement recorded as the reason; foxrun never silently rebinds them
+to R's replacement Execution.
 
 If Admission then succeeds:
 
@@ -1094,4 +1108,3 @@ The lifecycle can be reduced to:
 > **An Attempt owns exactly one OS process lifecycle.**
 
 > **Everything asynchronous—timers, process exits, client disconnects—is merely a request to perform a state transition. The authoritative state machine decides whether that transition is still valid.**
-

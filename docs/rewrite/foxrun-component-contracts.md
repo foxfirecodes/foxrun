@@ -31,7 +31,6 @@ Where a Request contains resolved CLI configuration sufficient to derive:
 * Key
 * optional Group
 * Execution Definition
-* contention policy
 
 ### Dependencies
 
@@ -88,6 +87,14 @@ Associates the Request with an existing Execution.
 
 Marks the Request as waiting for fresh execution.
 
+`subscribe(request_id, subscriber_id)`
+
+Registers a transport subscription for Request and Execution events.
+
+`unsubscribe(subscriber_id)`
+
+Removes only the subscription. It never cancels the Request or Execution.
+
 `assign(request_id, execution_id)`
 
 Associates the Request with newly-created work.
@@ -140,6 +147,11 @@ Returns the latest desired definition.
 
 Returns currently active work for equivalence/reuse decisions.
 
+`bind_scope(key, scope) -> ScopeBindingResult`
+
+Establishes the Key's Policy Scope on first use. A different Scope is rejected while the
+Key has active or pending work. Rebinding an idle Key is an explicit operation.
+
 `set_active(key, execution_id)`
 
 Claims the Key for an Execution.
@@ -150,26 +162,13 @@ Clears the active reference only if it still points to that Execution.
 
 That compare-by-ID behavior matters enormously for avoiding stale completion races.
 
-### Pending operations
-
-I’d expose semantic operations rather than a raw collection:
-
-`enqueue_fifo(key, request_id)`
-
-`replace_pending(key, request_id) -> Option<RequestId>`
-
-`take_next_pending(key) -> Option<RequestId>`
-
-`remove_pending(key, request_id)`
-
-The exact internal representation can vary.
-
 ### Invariants
 
 For a given Key:
 
 * exactly one current Execution Definition exists after first use
-* at most one active Execution exists if Key-level execution semantics require exclusivity
+* at most one nonterminal Execution exists
+* exactly one Policy Scope is bound after first use
 * an active Execution always refers to an immutable snapshot, never the mutable current definition
 * stale Execution completion cannot clear a newer active Execution
 
@@ -177,7 +176,7 @@ For a given Key:
 
 # Policy Scope Registry
 
-Authoritative owner of shared admission state.
+Authoritative owner of shared pending-work and admission state.
 
 ### Core operations
 
@@ -187,9 +186,34 @@ Pure identity resolution may happen elsewhere, but conceptually this is the mapp
 
 `group ?? key`
 
-`configure(scope, admission_policy)`
+`configure(scope, policy)`
 
-Updates shared policy configuration using defined last-wins semantics.
+Updates Group policy configuration. The new configuration applies immediately to
+existing pending Requests and future Admission decisions. Reconfiguration immediately
+reapplies Contention Policy to the pending-work set; for example, changing to `Latest`
+supersedes obsolete pending Requests for each Key. It does not revoke permits or mutate
+existing Execution snapshots.
+
+### Pending work
+
+The Policy Scope owns the authoritative pending-work set for every Key in the scope.
+It also owns the current Contention Policy used to change that set.
+
+`apply_contention(scope, key, request_id) -> PendingDisposition`
+
+Atomically evaluates same-Key active and pending work using the Scope's current policy.
+It may attach the Request, retain it as pending, supersede same-Key pending Requests,
+drop it, or request replacement of same-Key active work.
+
+`select_pending(scope) -> Option<RequestId>`
+
+Selects the **oldest runnable request**: the earliest received still-pending Request in
+the Scope whose Key has no nonterminal Execution. Key-aware indexes are an
+implementation detail of this scope-owned operation.
+
+`remove_pending(scope, request_id)`
+
+Removes a Request that became terminal or was assigned to an Execution.
 
 ### Admission state
 
@@ -285,13 +309,13 @@ Context contains immutable facts such as:
 Possible decisions:
 
 * `Attach(execution_id)`
-* `StartFresh`
-* `PendFifo`
-* `PendLatest`
+* `Pend`
+* `SupersedePendingAndPend`
 * `Drop`
 * `Replace(execution_id)`
 
-Potentially `StartFresh` and `Pend*` need not encode application mechanics beyond the semantic intent.
+Every fresh-work decision enters the Policy Scope's pending-work set before scheduler
+selection. `Pend` need not encode application mechanics beyond that semantic intent.
 
 ### Guarantee
 
@@ -303,11 +327,11 @@ Given identical domain inputs, it should return the same decision.
 
 # Pending Scheduler
 
-Owns **wakeup/index state**, not Request truth.
+Owns **wakeup state**, not Request or queue truth.
 
 ### Inputs
 
-`notify_pending(scope, key)`
+`notify_pending(scope)`
 
 Indicates that this scope contains work worth reconsidering.
 
@@ -327,9 +351,9 @@ When awakened:
 
 The Scheduler should ask authoritative components:
 
-* what pending work still exists?
+* which pending Request does the Policy Scope currently select?
 * can it now be admitted?
-* what is its latest definition?
+* what is that Request's Key's latest definition?
 
 It must not trust stale cached copies of Request/Key state.
 
@@ -587,6 +611,23 @@ Treat domain events primarily as observability/client-stream facts, while regist
 
 ---
 
+# Execution event streams and protocol v2
+
+The v2 IPC protocol is a breaking replacement for the current acquire/attach protocol.
+It exposes stable Request, Execution, and Attempt IDs; clients submit Requests and
+subscribe to Execution event streams rather than owning process leases.
+
+Each Execution has one bounded, ordered event stream. Lifecycle events and raw output
+share a monotonically increasing Execution sequence number. Output also includes its
+`AttemptId`, so retries remain visible as separate process lifecycles within one
+Execution.
+
+Subscriptions may request replay from a sequence cursor. Foxrun delivers retained replay
+before live events in sequence order. If the cursor precedes retained history, foxrun
+reports the truncation rather than silently claiming a complete replay.
+
+---
+
 # Definition snapshots
 
 I’d make `DefinitionVersion` first-class even if it initially feels unnecessary.
@@ -621,7 +662,7 @@ There are a few operations that need especially strong boundaries.
 
 Conceptually this must behave atomically as:
 
-1. select still-valid pending/current Request
+1. select a still-valid pending Request from the Policy Scope
 2. reserve Policy Scope capacity
 3. snapshot latest Execution Definition
 4. create Execution
@@ -742,4 +783,3 @@ This is the abstraction I’d keep in mind while implementing:
 And the rule connecting all four:
 
 > **Orchestrators read state from its owner, ask policies for decisions, commit changes through the owner, then invoke side effects through adapters.**
-

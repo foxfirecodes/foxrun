@@ -252,7 +252,7 @@ For each Request, it owns:
 
 - Request ID
 - Request state
-- associated client/subscriber
+- subscription IDs, independent of Request lifetime
 - associated pending work or Execution
 - final Request Outcome
 
@@ -286,10 +286,9 @@ The Key defines work equivalence.
 
 For each Key, the registry owns:
 
+- bound Policy Scope ID
 - current Execution Definition
 - reference to active Execution, if any
-- Key-local pending Request state
-- current contention configuration where applicable
 
 The active Execution itself remains owned by the Execution Manager. The Key Registry stores only its identity/reference.
 
@@ -298,11 +297,10 @@ The active Execution itself remains owned by the Execution Manager. The Key Regi
 The Key Registry:
 
 - resolves or registers Keys
+- establishes or validates the Key's Policy Scope binding
 - maintains the latest Execution Definition
 - applies last-wins definition updates
 - exposes active work for reuse or replacement
-- maintains Key-local pending disposition
-- provides the state required by Contention Policy
 
 ## Invariant
 
@@ -310,11 +308,15 @@ The Key Registry:
 
 It must not own Group concurrency counters or Group rate-limit state.
 
+A Key has exactly one bound Policy Scope and at most one nonterminal Execution. A
+submission with a different Scope is rejected while that Key has active or pending work;
+an idle Key may be rebound only through an explicit operation.
+
 ---
 
 # Policy Scope Registry
 
-The Policy Scope Registry owns shared admission state.
+The Policy Scope Registry owns shared pending-work and admission state.
 
 A Policy Scope is identified by:
 
@@ -325,6 +327,9 @@ A Policy Scope is identified by:
 
 For each Policy Scope, the registry owns:
 
+- current Contention Policy configuration
+- authoritative pending Request membership and Key-aware pending indexes
+- group-wide request-received ordering
 - active Execution references/count
 - concurrency configuration and state
 - rate-limit configuration and state
@@ -335,6 +340,9 @@ For each Policy Scope, the registry owns:
 The Policy Scope Registry:
 
 - resolves Policy Scopes
+- maintains the authoritative pending-work set and Key-aware indexes
+- applies the Scope's current Contention Policy to pending work
+- selects the oldest runnable pending Request for Admission
 - tracks Executions entering and leaving a scope
 - maintains concurrency state
 - maintains rate-limit state
@@ -382,13 +390,13 @@ Contention Policy should return explicit decisions such as:
 
 Attach the Request to an active Execution with the same Key.
 
-### FIFO
+### Queue
 
-Preserve Requests in arrival order for eventual fresh execution.
+Keep the Request in the Policy Scope's pending-work set for eventual fresh execution.
 
 ### Latest
 
-Keep only the newest pending Request for the relevant identity.
+Keep only the newest pending Request for the same Key within the Policy Scope.
 
 New Requests supersede obsolete pending Requests.
 
@@ -468,25 +476,27 @@ The Pending Scheduler:
 
 ## Boundary
 
-The Pending Scheduler does not determine which Requests survive contention.
-
-That belongs to Contention Policy.
+The Policy Scope Registry owns which pending Requests exist in its scope and the
+current Contention Policy that changes that set. The Pending Scheduler drives
+reconsideration and selection using that authoritative Group state.
 
 The Scheduler answers:
 
-> **When should surviving pending work be reconsidered?**
+> **Which pending Request in this Policy Scope should be considered now?**
 
-Contention Policy answers:
+The Policy Scope's Contention Policy answers:
 
-> **Which pending work should exist?**
+> **Which pending Requests for each Key should survive?**
 
 ## Queue Representation
 
-Do not model all pending work as one universal FIFO queue.
+Each Policy Scope owns one pending-work set spanning every Key in the scope. It may use
+per-Key indexes internally for same-Key contention decisions, but those indexes do not
+create Key-local queues. The Policy Scope is the authoritative queue owner.
 
-Different contention policies have different semantics, and pending work logically belongs to Keys while admission capacity belongs to Policy Scopes.
-
-The Scheduler may maintain indexes over pending work without making those indexes the authoritative owner of Request state.
+The initial selection rule is **oldest runnable request**: choose the earliest received
+pending Request whose Key has no nonterminal Execution. This is group-wide ordering with
+work-conserving behavior; it is not strict FIFO head-of-line blocking.
 
 ---
 
@@ -698,10 +708,11 @@ Every piece of mutable state must have one authoritative owner.
 | State | Authoritative Owner |
 |---|---|
 | Request lifecycle | Request Registry |
-| Client ↔ Request relationship | Request Registry |
+| Client subscription ↔ Request/Execution relationship | Request Registry |
+| Key ↔ Policy Scope binding | Key Registry |
 | Current Execution Definition | Key Registry |
 | Active Execution reference for a Key | Key Registry |
-| Key-local pending disposition | Key Registry |
+| Pending Request membership and contention policy | Policy Scope Registry |
 | Work equivalence | Key domain |
 | Shared concurrency state | Policy Scope Registry |
 | Shared rate-limit state | Policy Scope Registry |
@@ -768,11 +779,7 @@ The Broker registers the Request with the Request Registry.
 
 The Broker resolves its Key.
 
-## 4. Update desired state
-
-The Key Registry updates the Key's Execution Definition using last-wins semantics.
-
-## 5. Resolve Policy Scope
+## 4. Resolve and bind Policy Scope
 
 The Broker resolves:
 
@@ -782,9 +789,17 @@ or:
 
     no Group → Key Policy Scope
 
+The Key Registry establishes the binding on first use or validates the existing binding.
+A mismatched Group is rejected while the Key has active or pending work.
+
+## 5. Update desired state
+
+The Key Registry updates the Key's Execution Definition using last-wins semantics.
+
 ## 6. Evaluate contention
 
-Contention Policy evaluates existing Key state.
+The Policy Scope's Contention Policy evaluates existing same-Key state and its
+authoritative pending-work set.
 
 It may decide to:
 
@@ -795,13 +810,15 @@ It may decide to:
 - drop
 - cancel and replace
 
-## 7. Evaluate admission
+## 7. Queue and admit fresh work
 
-If fresh work is required, the Admission Controller evaluates the Policy Scope.
+Surviving work that requires a fresh Execution is recorded in the Policy Scope's
+pending-work set. The Pending Scheduler selects pending work from that Scope and the
+Admission Controller evaluates it.
 
-If admitted, execution may begin.
-
-If blocked, surviving work becomes pending and the Pending Scheduler tracks when it should be reconsidered.
+The selected Request may be admitted immediately, but it cannot bypass existing pending
+work in the same Scope. If Admission is blocked, the Scheduler tracks when the Scope
+should be reconsidered.
 
 ## 8. Create Execution
 

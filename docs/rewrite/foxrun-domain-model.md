@@ -35,6 +35,14 @@ The Key answers:
 
 > Are these Requests asking for the same logical work?
 
+A Key has exactly one Policy Scope binding. The first accepted Request establishes that
+binding. A later Request for the same Key with a different Group is rejected while the
+Key has active or pending work. Rebinding is an explicit idle-Key operation; it is never
+an implicit effect of submission.
+
+A Key has at most one nonterminal Execution. Multiple Requests may attach to that
+Execution, but fresh work for that Key cannot run concurrently with it.
+
 ### Policy Scope
 
 The state-sharing boundary for execution policies.
@@ -47,7 +55,7 @@ When `--group` is specified:
 
 `Policy Scope = Group`
 
-This allows otherwise-independent Keys to share policies such as concurrency and rate limits.
+This allows otherwise-independent Keys to share admission and pending-work policy.
 
 The Policy Scope answers:
 
@@ -59,13 +67,21 @@ An explicitly named Policy Scope shared by multiple Keys.
 
 Groups do not define work equivalence. Two different Keys in the same Group remain different work and cannot reuse each other's Executions.
 
-Groups exist solely to share policy state that would otherwise be scoped independently to each Key.
+Groups own the pending-work scheduler and admission state shared by their Keys. They do
+not own a Key's desired Command or execution-local behavior.
+
+A Key stores only its `PolicyScopeId` reference. It never duplicates Group policy
+configuration. Updating a Group policy therefore affects every Key bound to that Group
+immediately.
 
 ### Execution Definition
 
-The latest desired Command and execution policies associated with a Key.
+The latest desired Command and execution-local policies associated with a Key.
 
 New Requests update the Execution Definition using **last-wins semantics**.
+
+Execution-local policies include retry behavior, Attempt Timeout, Kill Grace, and
+Unobserved Grace.
 
 An already-running Execution is not mutated when the definition changes. Each Execution receives a snapshot of the Execution Definition when it starts.
 
@@ -125,7 +141,8 @@ Attached Requests observe the shared Execution's output and receive its final Ou
 
 A Request that has been accepted but has not yet been assigned to a new Execution.
 
-Pending Requests are governed by the Contention Policy and wait for Admission.
+Pending Requests belong to their Policy Scope's pending-work set. The Policy Scope
+scheduler selects them for Admission according to its current policy.
 
 ### Admission
 
@@ -142,7 +159,12 @@ Admission answers:
 
 ### Contention Policy
 
-The policy determining what happens when a Request encounters existing work or cannot immediately start a fresh Execution.
+The Policy Scope's current policy determining what happens when a Request encounters
+same-Key work or cannot immediately start a fresh Execution.
+
+Contention Policy is not part of an Execution Definition and is never snapshotted into
+an Execution. Changes apply immediately to existing pending Requests and new Requests
+in the Policy Scope.
 
 The supported behaviors are:
 
@@ -152,15 +174,15 @@ Attach to an active Execution with the same Key.
 
 No new Execution is created.
 
-#### FIFO
+#### Queue
 
-Preserve waiting Requests in arrival order.
-
-Each Request eventually produces fresh work as Admission permits.
+Place the Request in the Policy Scope's pending-work set. The scheduler selects it for
+Admission or it reaches a terminal Request state. A Request that requires fresh work
+must not bypass already-pending work in its Policy Scope.
 
 #### Latest
 
-Keep only the newest pending Request for the relevant identity.
+Keep only the newest pending Request for the same Key within the Policy Scope.
 
 A newer Request supersedes an older pending Request. Once admitted, one fresh Execution starts using the latest Execution Definition.
 
@@ -185,6 +207,19 @@ The replacement of obsolete work by newer intent.
 `latest` supersedes **pending** work.
 
 `replace` supersedes **active** work.
+
+### Queue Scheduling
+
+Each Policy Scope owns one pending-work scheduler. It considers Requests for every Key
+in that scope; Keys do not own independent queues.
+
+The initial scheduler uses **oldest runnable request** selection: among pending Requests
+whose Keys have no nonterminal Execution, it selects the one received earliest in that
+Policy Scope. This preserves intuitive group-wide arrival order without idling capacity
+behind an older Request whose Key is still active.
+
+Round-robin, priorities, and strict FIFO are future scheduler strategies. They do not
+change queue ownership: the Policy Scope remains the sole scheduler and queue owner.
 
 ### Concurrency Limit
 
@@ -277,6 +312,12 @@ An initial request for an active child process to terminate, normally using `SIG
 
 The amount of time foxrun allows for Graceful Termination before escalating to Forced Termination.
 
+### Unobserved Grace
+
+The amount of time an Execution remains alive after its final client subscription ends.
+When it expires, foxrun cancels the unobserved Execution. Unobserved Grace is part of
+the Execution Definition and is snapshotted when the Execution starts.
+
 ### Forced Termination
 
 Termination of a child process after its Kill Grace expires, normally using `SIGKILL`.
@@ -323,7 +364,8 @@ With a Group:
     Key B ─┼→ Group "builds"
     Key C ─┘
 
-The three Keys now share concurrency and rate-limit state while remaining distinct work.
+The three Keys now share pending-work scheduling, concurrency, and rate-limit state
+while remaining distinct work.
 
 An Execution for Key A can therefore consume capacity that prevents Key B from being admitted, but a Request for Key B can never reuse an Execution for Key A.
 
@@ -333,7 +375,8 @@ An Execution for Key A can therefore consume capacity that prevents Key B from b
 
 Each Key has a current Execution Definition.
 
-When a Request arrives, its Command and policy configuration become the latest definition for that Key.
+When a Request arrives, its Command and execution-local policy configuration become
+the latest definition for that Key.
 
 Updates use **last-wins semantics**.
 
@@ -347,7 +390,10 @@ For example:
 6. The Contention Policy determines what happens to Request B.
 7. If another Execution eventually starts, it uses the latest definition.
 
-Policy updates and Command updates therefore follow the same semantics.
+Group Policy Scope configuration is not part of this definition. Group changes are
+immediate: they govern existing pending Requests and all future Admission decisions.
+An already-admitted Execution retains its Admission Permit and its immutable Execution
+Definition snapshot; changing Group policy never retroactively cancels it.
 
 ---
 
@@ -365,15 +411,25 @@ A Request requiring fresh work is evaluated against the Policy Scope's:
 - concurrency limit
 - rate-limit state
 
-If Admission fails, the Contention Policy determines whether the Request remains pending, supersedes other work, is dropped, or causes active work to be replaced.
+If Admission fails, the Policy Scope's Contention Policy determines whether the Request
+remains pending, supersedes same-Key pending work, is dropped, or causes same-Key active
+work to be replaced.
 
 Reuse is special in that no fresh Execution is required: a matching Request may instead attach to existing work for the same Key.
 
-The CLI may expose this concept as:
+The CLI must configure Group Policy Scope behavior separately from the Key's Execution
+Definition. It must not allow individual queued Requests to carry conflicting queue
+policies.
 
-`--when-busy <reuse|fifo|latest|drop|replace>`
+### Client connections and subscriptions
 
-The domain model does not prescribe which behavior must ultimately be foxrun's default.
+A client connection is a subscription transport, not the owner of a Request or
+Execution. Disconnecting removes that client's subscription but does not cancel its
+Request or Execution. A later client may subscribe to the still-live Execution.
+
+An Execution with no subscriptions enters its configured unobserved grace period. A new
+subscription cancels that grace period. On expiry, foxrun cancels the Execution with an
+`unobserved` reason; associated Requests then receive the resulting terminal Outcome.
 
 ---
 
@@ -419,9 +475,9 @@ In detail:
 2. Resolve its Key.
 3. Update the Key's Execution Definition using last-wins semantics.
 4. Resolve its Policy Scope: explicit Group or Key by default.
-5. Apply the Contention Policy against existing work.
-6. If fresh work is required, evaluate Admission.
-7. Pending work waits, is superseded, or is dropped according to contention semantics.
+5. Apply the Policy Scope's Contention Policy against existing same-Key work.
+6. Record surviving fresh work in the Policy Scope's pending-work set.
+7. The Policy Scope scheduler selects pending work and evaluates Admission.
 8. Once admitted, create an Execution from the latest Execution Definition.
 9. Create its first Attempt.
 10. Enforce Attempt Timeout and termination behavior.
@@ -485,7 +541,8 @@ The domain should maintain the following invariants:
 9. **Only Executions consume concurrency capacity.**
 10. **Only Execution admission consumes rate-limit capacity.**
 11. **Attempt Timeout applies independently to each Attempt.**
-12. **Contention Policy determines disposition of competing Requests; Admission determines whether fresh work may start.**
+12. **A Policy Scope owns pending-work scheduling, Contention Policy, and Admission state.**
+13. **Contention Policy determines disposition of competing Requests; Admission determines whether fresh work may start.**
 
 ---
 
