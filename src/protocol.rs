@@ -14,63 +14,105 @@ pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 
 /// A message a client may send to the broker.
 ///
-/// A connection must send exactly one [`ClientMessage::Acquire`] as its first
-/// message. There are no further client-to-broker messages in the MVP.
+/// Version two deliberately models a connection as a transport for zero or
+/// more subscriptions.  It is not a lease on a process.  Frames stay exactly
+/// as they were in v1 (bounded, length-prefixed JSON); only their vocabulary
+/// changed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
-    Acquire {
+    Submit {
         cwd: String,
         argv: Vec<String>,
-        tail_lines: usize,
-        broker_timeout_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<String>,
+        #[serde(default)]
+        policies: SubmitPolicies,
+    },
+    Subscribe {
+        request_id: String,
+        /// Replays events strictly after this cursor.  Omitted means replay
+        /// every event the broker retains for the request/execution.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<u64>,
+    },
+    CancelRequest {
+        request_id: String,
+    },
+    Unsubscribe {
+        subscription_id: String,
     },
 }
 
 impl ClientMessage {
-    /// Returns the acquire request after checking protocol-level invariants.
-    pub fn validate(self) -> Result<AcquireRequest, ProtocolError> {
+    /// Returns a validated submit request after checking transport-level
+    /// invariants. Semantic policy validation belongs to the application.
+    pub fn validate_submit(self) -> Result<SubmitRequest, ProtocolError> {
         match self {
-            Self::Acquire {
+            Self::Submit {
                 cwd,
                 argv,
-                tail_lines,
-                broker_timeout_ms,
+                key,
+                group,
+                policies,
             } => {
                 if cwd.is_empty() {
-                    return Err(ProtocolError::InvalidAcquire(
+                    return Err(ProtocolError::InvalidSubmit(
                         "cwd must not be empty".to_owned(),
                     ));
                 }
                 if argv.is_empty() || argv[0].is_empty() {
-                    return Err(ProtocolError::InvalidAcquire(
+                    return Err(ProtocolError::InvalidSubmit(
                         "argv must contain a non-empty executable".to_owned(),
                     ));
                 }
-                if broker_timeout_ms == 0 {
-                    return Err(ProtocolError::InvalidAcquire(
-                        "broker_timeout_ms must be positive".to_owned(),
+                if key.as_deref().is_some_and(str::is_empty)
+                    || group.as_deref().is_some_and(str::is_empty)
+                {
+                    return Err(ProtocolError::InvalidSubmit(
+                        "key and group must not be empty when supplied".to_owned(),
                     ));
                 }
 
-                Ok(AcquireRequest {
+                Ok(SubmitRequest {
                     cwd,
                     argv,
-                    tail_lines,
-                    broker_timeout_ms,
+                    key,
+                    group,
+                    policies,
                 })
             }
+            _ => Err(ProtocolError::ExpectedSubmit),
         }
     }
 }
 
-/// A validated command-acquisition request.
+/// A validated command-submission request.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AcquireRequest {
+pub struct SubmitRequest {
     pub cwd: String,
     pub argv: Vec<String>,
-    pub tail_lines: usize,
-    pub broker_timeout_ms: u64,
+    pub key: Option<String>,
+    pub group: Option<String>,
+    pub policies: SubmitPolicies,
+}
+
+/// Execution-local policy configuration carried on a submit frame.
+///
+/// Scope policy is intentionally absent: a request cannot smuggle a
+/// conflicting queue policy into a group it does not own.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SubmitPolicies {
+    pub retry_limit: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kill_grace_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unobserved_grace_ms: Option<u64>,
 }
 
 /// Which command output stream produced a chunk.
@@ -81,20 +123,112 @@ pub enum OutputStream {
     Stderr,
 }
 
+/// Ordered event reported by the broker.
+///
+/// `sequence` is monotonically increasing within an Execution's event log.
+/// This gives reconnecting subscribers a stable replay cursor while allowing
+/// request-only events to remain correlated without inventing a second order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleEvent {
+    pub sequence: u64,
+    pub request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
+    #[serde(flatten)]
+    pub kind: LifecycleEventKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum LifecycleEventKind {
+    RequestReceived,
+    RequestAttached,
+    RequestPending,
+    RequestAssigned,
+    RequestDropped {
+        reason: String,
+    },
+    RequestSuperseded {
+        by_request_id: String,
+    },
+    RequestRejected {
+        reason: String,
+    },
+    ExecutionCreated,
+    AttemptStarted {
+        attempt_id: String,
+    },
+    Output {
+        attempt_id: String,
+        stream: OutputStream,
+        data_base64: String,
+    },
+    RetryScheduled {
+        after_ms: u64,
+    },
+    AttemptCompleted {
+        attempt_id: String,
+        outcome: WireOutcome,
+    },
+    ExecutionCompleted {
+        outcome: WireOutcome,
+    },
+    RequestCompleted {
+        outcome: WireOutcome,
+    },
+    ExecutionCancelling {
+        reason: String,
+    },
+}
+
+/// The client-visible semantic outcome. Process status is optional metadata;
+/// termination reasons are never inferred from an incidental signal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum WireOutcome {
+    Succeeded,
+    Failed {
+        code: Option<i32>,
+        signal: Option<i32>,
+    },
+    TimedOut,
+    Cancelled {
+        reason: Option<String>,
+    },
+    Dropped {
+        reason: String,
+    },
+    Superseded {
+        by_request_id: String,
+    },
+    Rejected {
+        reason: String,
+    },
+}
+
 /// A message the broker may send to a client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BrokerMessage {
-    Attached {
-        reused: bool,
+    Submitted {
+        request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution_id: Option<String>,
     },
-    Output {
-        stream: OutputStream,
-        data_base64: String,
+    Subscribed {
+        subscription_id: String,
+        request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution_id: Option<String>,
     },
-    Exit {
-        code: Option<i32>,
-        signal: Option<i32>,
+    Event {
+        event: LifecycleEvent,
+    },
+    Cancelled {
+        request_id: String,
+    },
+    Unsubscribed {
+        subscription_id: String,
     },
     Error {
         message: String,
@@ -103,15 +237,30 @@ pub enum BrokerMessage {
 
 impl BrokerMessage {
     /// Creates an output event with its bytes encoded for JSON transport.
-    pub fn output(stream: OutputStream, data: &[u8]) -> Self {
-        Self::Output {
-            stream,
-            data_base64: encode_output(data),
+    pub fn output_event(
+        sequence: u64,
+        request_id: impl Into<String>,
+        execution_id: impl Into<String>,
+        attempt_id: impl Into<String>,
+        stream: OutputStream,
+        data: &[u8],
+    ) -> Self {
+        Self::Event {
+            event: LifecycleEvent {
+                sequence,
+                request_id: request_id.into(),
+                execution_id: Some(execution_id.into()),
+                kind: LifecycleEventKind::Output {
+                    attempt_id: attempt_id.into(),
+                    stream,
+                    data_base64: encode_output(data),
+                },
+            },
         }
     }
 }
 
-/// Encodes raw process output for an [`BrokerMessage::Output`] event.
+/// Encodes raw process output for a lifecycle output event.
 pub fn encode_output(data: &[u8]) -> String {
     STANDARD.encode(data)
 }
@@ -129,7 +278,8 @@ pub enum ProtocolError {
     Io(io::Error),
     Json(serde_json::Error),
     FrameTooLarge { length: usize },
-    InvalidAcquire(String),
+    InvalidSubmit(String),
+    ExpectedSubmit,
     InvalidBase64(String),
 }
 
@@ -142,9 +292,10 @@ impl fmt::Display for ProtocolError {
                 formatter,
                 "protocol frame is {length} bytes; the maximum is {MAX_FRAME_SIZE} bytes"
             ),
-            Self::InvalidAcquire(message) => {
-                write!(formatter, "invalid acquire request: {message}")
+            Self::InvalidSubmit(message) => {
+                write!(formatter, "invalid submit request: {message}")
             }
+            Self::ExpectedSubmit => write!(formatter, "expected a submit request"),
             Self::InvalidBase64(message) => write!(formatter, "invalid output base64: {message}"),
         }
     }
@@ -223,7 +374,7 @@ where
     write_payload(writer, &payload).await
 }
 
-/// Backwards-compatible name for [`read_frame`].
+/// Convenience name for [`read_frame`].
 pub async fn read_message<R, T>(reader: &mut R) -> Result<T, ProtocolError>
 where
     R: AsyncRead + Unpin,
@@ -232,7 +383,7 @@ where
     read_frame(reader).await
 }
 
-/// Backwards-compatible name for [`write_frame`].
+/// Convenience name for [`write_frame`].
 pub async fn write_message<W, T>(writer: &mut W, message: &T) -> Result<(), ProtocolError>
 where
     W: AsyncWrite + Unpin,
@@ -249,11 +400,12 @@ mod tests {
     #[tokio::test]
     async fn frames_round_trip_messages() {
         let (mut writer, mut reader) = duplex(4096);
-        let message = ClientMessage::Acquire {
+        let message = ClientMessage::Submit {
             cwd: "/tmp/work".to_owned(),
             argv: vec!["command".to_owned(), "hello world".to_owned()],
-            tail_lines: 50,
-            broker_timeout_ms: 5_000,
+            key: None,
+            group: Some("builds".to_owned()),
+            policies: SubmitPolicies::default(),
         };
 
         write_frame(&mut writer, &message).await.unwrap();
@@ -288,37 +440,61 @@ mod tests {
     #[test]
     fn output_events_preserve_arbitrary_bytes() {
         let bytes = [0, b'\n', 0xff, b'a'];
-        let message = BrokerMessage::output(OutputStream::Stderr, &bytes);
+        let message = BrokerMessage::output_event(
+            7,
+            "request-1",
+            "execution-1",
+            "attempt-1",
+            OutputStream::Stderr,
+            &bytes,
+        );
 
-        let BrokerMessage::Output { data_base64, .. } = &message else {
+        let BrokerMessage::Event { event } = &message else {
             panic!("expected output message");
+        };
+        let LifecycleEventKind::Output { data_base64, .. } = &event.kind else {
+            panic!("expected output event");
         };
         assert_eq!(decode_output(data_base64).unwrap(), bytes);
         assert_eq!(
             serde_json::to_string(&message).unwrap(),
-            r#"{"type":"output","stream":"stderr","data_base64":"AAr/YQ=="}"#
+            r#"{"type":"event","event":{"sequence":7,"request_id":"request-1","execution_id":"execution-1","event":"output","attempt_id":"attempt-1","stream":"stderr","data_base64":"AAr/YQ=="}}"#
         );
     }
 
     #[test]
-    fn validates_acquire_fields() {
-        let invalid = ClientMessage::Acquire {
+    fn validates_submit_fields() {
+        let invalid = ClientMessage::Submit {
             cwd: String::new(),
             argv: vec!["command".to_owned()],
-            tail_lines: 0,
-            broker_timeout_ms: 1,
+            key: None,
+            group: None,
+            policies: SubmitPolicies::default(),
         };
         assert!(matches!(
-            invalid.validate(),
-            Err(ProtocolError::InvalidAcquire(_))
+            invalid.validate_submit(),
+            Err(ProtocolError::InvalidSubmit(_))
         ));
 
-        let valid = ClientMessage::Acquire {
+        let valid = ClientMessage::Submit {
             cwd: "/tmp/work".to_owned(),
             argv: vec!["command".to_owned()],
-            tail_lines: 0,
-            broker_timeout_ms: 1,
+            key: None,
+            group: None,
+            policies: SubmitPolicies::default(),
         };
-        assert_eq!(valid.validate().unwrap().argv, ["command"]);
+        assert_eq!(valid.validate_submit().unwrap().argv, ["command"]);
+    }
+
+    #[test]
+    fn subscription_cursor_is_optional_and_wire_stable() {
+        let message = ClientMessage::Subscribe {
+            request_id: "request-1".into(),
+            after: Some(41),
+        };
+        assert_eq!(
+            serde_json::to_string(&message).unwrap(),
+            r#"{"type":"subscribe","request_id":"request-1","after":41}"#
+        );
     }
 }

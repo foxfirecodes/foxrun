@@ -1,6 +1,9 @@
+mod application;
 mod broker;
 mod client;
+mod domain;
 mod protocol;
+mod registries;
 
 use std::path::PathBuf;
 use std::time::Duration;

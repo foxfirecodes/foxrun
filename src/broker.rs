@@ -1,633 +1,287 @@
-//! The local process broker.
-//!
-//! This module deliberately keeps process ownership in one actor.  Socket
-//! tasks only turn connections into leases and forward the actor's messages.
-
-use std::collections::{HashMap, VecDeque};
-use std::hash::{Hash, Hasher};
-use std::os::unix::process::ExitStatusExt;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
-
+//! v2 Unix-socket adapter.  The application owns all lifecycle truth; this
+//! module only serializes commands and performs process side effects.
+use crate::{
+    application::{Application, Effect, LifecycleEvent as AppEvent, StreamEvent, SubmitRequest},
+    domain::{Command as DomainCommand, *},
+    protocol::{self, *},
+};
 use anyhow::{Context, Result};
-use serde::Serialize;
-use tokio::io::AsyncReadExt;
-use tokio::net::{UnixListener, UnixStream};
-use tokio::process::Command;
-use tokio::sync::{mpsc, oneshot};
+use std::{
+    collections::HashMap, os::unix::process::CommandExt, path::PathBuf, sync::Arc, time::Duration,
+};
+use tokio::{
+    io::AsyncReadExt,
+    net::{UnixListener, UnixStream},
+    process::Command,
+    sync::{Mutex, mpsc},
+};
 
-use crate::protocol::{self, AcquireRequest, BrokerMessage, ClientMessage, OutputStream};
+type Outbound = mpsc::UnboundedSender<BrokerMessage>;
+type Subscribers = Arc<Mutex<HashMap<ExecutionId, HashMap<SubscriptionId, Outbound>>>>;
+type Attempts = Arc<Mutex<HashMap<AttemptId, i32>>>;
 
-const HISTORY_LINES: usize = 1_000;
-const OUTPUT_CHUNK: usize = 8 * 1024;
-// One output frame may be in flight. Keep a second slot for the terminal exit
-// frame so it remains ordered after the final output frame.
-const CLIENT_WRITER_QUEUE: usize = 2;
-const CLIENT_BACKLOG_BYTES: usize = protocol::MAX_FRAME_SIZE;
-
-type ClientId = u64;
-
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
-struct ProcessKey(String);
-
-#[derive(Serialize)]
-struct Identity<'a> {
-    cwd: &'a str,
-    argv: &'a [String],
-}
-
-impl ProcessKey {
-    fn new(request: &AcquireRequest) -> Result<Self> {
-        // Keep the serialized value as well as relying on HashMap's hash. This
-        // meets the structured-key requirement and cannot confuse two values
-        // merely because their argv would look the same when space-joined.
-        let json = serde_json::to_string(&Identity {
-            cwd: &request.cwd,
-            argv: &request.argv,
-        })?;
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        json.hash(&mut hasher);
-        Ok(Self(format!("{:016x}:{json}", hasher.finish())))
-    }
-}
-
-#[derive(Clone)]
-struct Client {
-    id: ClientId,
-    messages: mpsc::Sender<BrokerMessage>,
-    close: mpsc::UnboundedSender<()>,
-}
-
-#[derive(Clone)]
-struct OutputChunk {
-    message: BrokerMessage,
-    wire_bytes: usize,
-}
-
-impl OutputChunk {
-    fn new(stream: OutputStream, data: &[u8]) -> Self {
-        let message = BrokerMessage::output(stream, data);
-        let wire_bytes = serde_json::to_vec(&message)
-            .expect("output messages always serialize")
-            .len()
-            + std::mem::size_of::<u32>();
-        Self {
-            message,
-            wire_bytes,
-        }
-    }
-}
-
-struct ByteQueue {
-    messages: VecDeque<OutputChunk>,
-    wire_bytes: usize,
-}
-
-impl ByteQueue {
-    fn new() -> Self {
-        Self {
-            messages: VecDeque::new(),
-            wire_bytes: 0,
-        }
-    }
-
-    fn push(&mut self, message: OutputChunk, in_flight_bytes: usize) -> bool {
-        let Some(total) = self
-            .wire_bytes
-            .checked_add(in_flight_bytes)
-            .and_then(|bytes| bytes.checked_add(message.wire_bytes))
-        else {
-            return false;
-        };
-        if total > CLIENT_BACKLOG_BYTES {
-            return false;
-        }
-        self.wire_bytes += message.wire_bytes;
-        self.messages.push_back(message);
-        true
-    }
-
-    fn pop(&mut self) -> Option<OutputChunk> {
-        let message = self.messages.pop_front()?;
-        self.wire_bytes -= message.wire_bytes;
-        Some(message)
-    }
-}
-
-struct Replay {
-    lines: VecDeque<HistoryLine>,
-    offset: usize,
-}
-
-impl Replay {
-    fn new(lines: VecDeque<HistoryLine>) -> Self {
-        Self { lines, offset: 0 }
-    }
-
-    fn next(&mut self) -> Option<OutputChunk> {
-        let line = self.lines.front()?;
-        let end = (self.offset + OUTPUT_CHUNK).min(line.data.len());
-        let chunk = OutputChunk::new(line.stream, &line.data[self.offset..end]);
-        if end == line.data.len() {
-            self.lines.pop_front();
-            self.offset = 0;
-        } else {
-            self.offset = end;
-        }
-        Some(chunk)
-    }
-}
-
-enum DeliveryState {
-    Replaying { replay: Replay, pending: ByteQueue },
-    Live { pending: ByteQueue },
-}
-
-struct Delivery {
-    client: Client,
-    state: DeliveryState,
-    writer_ready: bool,
-    in_flight_bytes: usize,
-}
-
-impl Delivery {
-    fn replaying(client: Client, lines: VecDeque<HistoryLine>) -> Self {
-        Self {
-            client,
-            state: DeliveryState::Replaying {
-                replay: Replay::new(lines),
-                pending: ByteQueue::new(),
-            },
-            writer_ready: false,
-            in_flight_bytes: 0,
-        }
-    }
-
-    fn live(client: Client) -> Self {
-        Self {
-            client,
-            state: DeliveryState::Live {
-                pending: ByteQueue::new(),
-            },
-            writer_ready: false,
-            in_flight_bytes: 0,
-        }
-    }
-
-    fn enqueue(&mut self, message: OutputChunk) -> bool {
-        let pending = match &mut self.state {
-            DeliveryState::Replaying { pending, .. } | DeliveryState::Live { pending } => pending,
-        };
-        pending.push(message, self.in_flight_bytes)
-    }
-
-    fn writer_ready(&mut self) -> bool {
-        self.writer_ready = true;
-        self.in_flight_bytes = 0;
-        self.deliver_next()
-    }
-
-    fn deliver_next(&mut self) -> bool {
-        if !self.writer_ready {
-            return true;
-        }
-        let message = loop {
-            match &mut self.state {
-                DeliveryState::Replaying { replay, .. } => {
-                    if let Some(message) = replay.next() {
-                        break Some(message);
-                    }
-                    let DeliveryState::Replaying { pending, .. } = std::mem::replace(
-                        &mut self.state,
-                        DeliveryState::Live {
-                            pending: ByteQueue::new(),
-                        },
-                    ) else {
-                        unreachable!("state was checked above");
-                    };
-                    self.state = DeliveryState::Live { pending };
-                }
-                DeliveryState::Live { pending } => break pending.pop(),
-            }
-        };
-        let Some(message) = message else {
-            return true;
-        };
-        if !send(&self.client, message.message.clone()) {
-            return false;
-        }
-        self.writer_ready = false;
-        self.in_flight_bytes = message.wire_bytes;
-        true
-    }
-}
-
-struct ProcessRecord {
-    timeout: Duration,
-    process_group: i32,
-    clients: HashMap<ClientId, Delivery>,
-    history: VecDeque<HistoryLine>,
-    partial_stdout: Vec<u8>,
-    partial_stderr: Vec<u8>,
-    idle_generation: u64,
-}
-
-#[derive(Clone)]
-struct HistoryLine {
-    stream: OutputStream,
-    data: Vec<u8>,
-}
-
-enum Event {
-    Acquire {
-        request: AcquireRequest,
-        client: Client,
-        response: oneshot::Sender<Result<(), String>>,
-    },
-    Disconnect {
-        key: ProcessKey,
-        client_id: ClientId,
-    },
-    Output {
-        key: ProcessKey,
-        stream: OutputStream,
-        data: Vec<u8>,
-    },
-    Exited {
-        key: ProcessKey,
-        code: Option<i32>,
-        signal: Option<i32>,
-    },
-    IdleExpired {
-        key: ProcessKey,
-        generation: u64,
-    },
-    WriterReady {
-        client_id: ClientId,
-    },
-    ConnectionClosed,
-}
-
-/// Serve a broker until it has no live commands or client leases.
 pub async fn run(socket: PathBuf) -> Result<()> {
     let listener =
         UnixListener::bind(&socket).with_context(|| format!("listen on {}", socket.display()))?;
-    let (events, mut receiver) = mpsc::channel(256);
-    let events = Arc::new(events);
-    let mut records = HashMap::<ProcessKey, ProcessRecord>::new();
-    let mut client_keys = HashMap::<ClientId, ProcessKey>::new();
-    let mut next_client = 1_u64;
-    let mut connections = 0_usize;
-    // The launching client connects only after this process has bound its
-    // socket. Do not treat that short window as an idle broker.
-    let mut accepted_connection = false;
-    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-
+    let app = Arc::new(Mutex::new(Application::new()));
+    let subscribers = Arc::new(Mutex::new(HashMap::new()));
+    let attempts = Arc::new(Mutex::new(HashMap::new()));
+    let mut next_subscription = 1_u64;
     loop {
-        tokio::select! {
-            accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => {
-                    accepted_connection = true;
-                    let id = next_client;
-                    next_client = next_client.wrapping_add(1);
-                    connections += 1;
-                    let connection_events = Arc::clone(&events);
-                    tokio::spawn(async move {
-                        handle_connection(stream, id, Arc::clone(&connection_events)).await;
-                        let _ = connection_events.send(Event::ConnectionClosed).await;
-                    });
-                }
-                Err(error) => return Err(error).context("accept broker client"),
-            },
-            event = receiver.recv() => match event {
-                Some(Event::ConnectionClosed) => connections = connections.saturating_sub(1),
-                Some(event) => handle_event(event, &mut records, &mut client_keys, &events).await,
-                None => break,
-            },
-            _ = interrupt.recv() => break,
-            _ = terminate.recv() => break,
-        }
-
-        if accepted_connection && records.is_empty() && connections == 0 {
-            // There cannot be a lease once its record has gone. The next
-            // invocation starts a new broker if it races this orderly exit.
-            break;
-        }
+        let (stream, _) = listener.accept().await.context("accept broker client")?;
+        let id = SubscriptionId(next_subscription);
+        next_subscription += 1;
+        tokio::spawn(handle(
+            stream,
+            id,
+            Arc::clone(&app),
+            Arc::clone(&subscribers),
+            Arc::clone(&attempts),
+        ));
     }
-
-    terminate_all(records.values().map(|record| record.process_group)).await;
-    let _ = std::fs::remove_file(&socket);
-    Ok(())
 }
 
-async fn handle_connection(
+async fn handle(
     stream: UnixStream,
-    client_id: ClientId,
-    events: Arc<mpsc::Sender<Event>>,
+    id: SubscriptionId,
+    app: Arc<Mutex<Application>>,
+    subscribers: Subscribers,
+    attempts: Attempts,
 ) {
     let (mut reader, mut writer) = stream.into_split();
-    let (messages, mut outbound) = mpsc::channel(CLIENT_WRITER_QUEUE);
-    let (close, mut close_rx) = mpsc::unbounded_channel();
-    let (writer_closed, mut writer_closed_rx) = oneshot::channel();
-    let writer_events = Arc::clone(&events);
-    tokio::spawn(async move {
-        while let Some(message) = outbound.recv().await {
-            if protocol::write_message(&mut writer, &message)
-                .await
-                .is_err()
-            {
-                break;
-            }
-            if matches!(
-                message,
-                BrokerMessage::Exit { .. } | BrokerMessage::Error { .. }
-            ) {
-                break;
-            }
-            if writer_events
-                .send(Event::WriterReady { client_id })
-                .await
-                .is_err()
-            {
+    let (out, mut rx) = mpsc::unbounded_channel();
+    let writer_task = tokio::spawn(async move {
+        while let Some(message) = rx.recv().await {
+            if protocol::write_frame(&mut writer, &message).await.is_err() {
                 break;
             }
         }
-        let _ = writer_closed.send(());
     });
-
-    let request = match protocol::read_message::<_, ClientMessage>(&mut reader).await {
-        Ok(message) => match message.validate() {
-            Ok(request) => request,
-            Err(error) => {
-                let _ = messages
-                    .send(BrokerMessage::Error {
-                        message: error.to_string(),
-                    })
-                    .await;
-                let _ = (&mut writer_closed_rx).await;
-                return;
+    while let Ok(message) = protocol::read_frame::<_, ClientMessage>(&mut reader).await {
+        match message {
+            ClientMessage::Submit {
+                cwd,
+                argv,
+                key,
+                group,
+                policies,
+            } => {
+                let submit = match make_submit(cwd, argv, key, group, policies) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        let _ = out.send(BrokerMessage::Error {
+                            message: e.to_string(),
+                        });
+                        continue;
+                    }
+                };
+                let (result, effects) = {
+                    let mut a = app.lock().await;
+                    let r = a.submit(Duration::ZERO, submit);
+                    (r, a.take_effects())
+                };
+                let _ = out.send(BrokerMessage::Submitted {
+                    request_id: id_text(result.request_id),
+                    execution_id: result.execution_id.map(id_text),
+                });
+                apply_effects(app.clone(), subscribers.clone(), attempts.clone(), effects);
             }
-        },
-        Err(error) => {
-            let _ = messages
-                .send(BrokerMessage::Error {
-                    message: error.to_string(),
-                })
-                .await;
-            let _ = (&mut writer_closed_rx).await;
-            return;
-        }
-    };
-    let valid_cwd = std::fs::canonicalize(&request.cwd)
-        .map(|path| path.is_dir() && path == Path::new(&request.cwd))
-        .unwrap_or(false);
-    if !Path::new(&request.cwd).is_absolute() || !valid_cwd {
-        let _ = messages
-            .send(BrokerMessage::Error {
-                message: "cwd must be an existing canonical absolute directory".into(),
-            })
-            .await;
-        let _ = (&mut writer_closed_rx).await;
-        return;
-    }
-    let key = match ProcessKey::new(&request) {
-        Ok(key) => key,
-        Err(error) => {
-            let _ = messages
-                .send(BrokerMessage::Error {
-                    message: error.to_string(),
-                })
-                .await;
-            let _ = (&mut writer_closed_rx).await;
-            return;
-        }
-    };
-    let (response_tx, response_rx) = oneshot::channel();
-    if events
-        .send(Event::Acquire {
-            request,
-            client: Client {
-                id: client_id,
-                messages: messages.clone(),
-                close,
+            ClientMessage::Subscribe { request_id, after } => match parse_id(&request_id) {
+                Some(request) => {
+                    let subscribed = {
+                        let mut a = app.lock().await;
+                        a.subscribe_with_replay(request, id, after.unwrap_or(0))
+                    };
+                    if let Some((execution, replay)) = subscribed {
+                        subscribers
+                            .lock()
+                            .await
+                            .entry(execution)
+                            .or_default()
+                            .insert(id, out.clone());
+                        let _ = out.send(BrokerMessage::Subscribed {
+                            subscription_id: id_text(id),
+                            request_id,
+                            execution_id: Some(id_text(execution)),
+                        });
+                        for event in replay {
+                            let _ = out.send(wire_event(execution, event));
+                        }
+                    } else {
+                        let _ = out.send(BrokerMessage::Error {
+                            message: "unknown or not-yet-executing request".into(),
+                        });
+                    }
+                }
+                None => {
+                    let _ = out.send(BrokerMessage::Error {
+                        message: "invalid request id".into(),
+                    });
+                }
             },
-            response: response_tx,
-        })
-        .await
-        .is_err()
-    {
-        return;
-    }
-    match response_rx.await {
-        Ok(Ok(())) => {}
-        Ok(Err(message)) => {
-            let _ = messages.send(BrokerMessage::Error { message }).await;
-            let _ = (&mut writer_closed_rx).await;
-            return;
-        }
-        Err(_) => return,
-    }
-
-    // There is no further client message in this protocol. Reading until EOF
-    // both detects a closed lease and rejects accidental extra frames.
-    tokio::select! {
-        read = protocol::read_message::<_, ClientMessage>(&mut reader) => {
-            if read.is_ok() {
-                let _ = messages.send(BrokerMessage::Error {
-                    message: "a connection may send only one acquire request".into(),
-                }).await;
-                let _ = (&mut writer_closed_rx).await;
+            ClientMessage::CancelRequest { request_id } => {
+                if let Some(request) = parse_id(&request_id) {
+                    let (ok, effects) = {
+                        let mut a = app.lock().await;
+                        (a.cancel_request(Duration::ZERO, request), a.take_effects())
+                    };
+                    if ok {
+                        let _ = out.send(BrokerMessage::Cancelled { request_id });
+                        apply_effects(app.clone(), subscribers.clone(), attempts.clone(), effects);
+                    }
+                }
+            }
+            ClientMessage::Unsubscribe { subscription_id } => {
+                if subscription_id == id_text(id) {
+                    detach(&app, &subscribers, id).await;
+                    let _ = out.send(BrokerMessage::Unsubscribed { subscription_id });
+                }
             }
         }
-        _ = &mut writer_closed_rx => {}
-        _ = close_rx.recv() => {}
     }
-    let _ = events.send(Event::Disconnect { key, client_id }).await;
+    detach(&app, &subscribers, id).await;
+    writer_task.abort();
 }
 
-async fn handle_event(
-    event: Event,
-    records: &mut HashMap<ProcessKey, ProcessRecord>,
-    client_keys: &mut HashMap<ClientId, ProcessKey>,
-    events: &mpsc::Sender<Event>,
+fn make_submit(
+    cwd: String,
+    argv: Vec<String>,
+    key: Option<String>,
+    group: Option<String>,
+    p: SubmitPolicies,
+) -> Result<SubmitRequest> {
+    if cwd.is_empty() || argv.first().is_none_or(String::is_empty) {
+        anyhow::bail!("invalid submit command");
+    }
+    let key = Key(key.unwrap_or_else(|| format!("{cwd}\0{}", argv.join("\0"))));
+    Ok(SubmitRequest {
+        key,
+        group: group.map(GroupId),
+        definition: ExecutionDefinition {
+            command: DomainCommand {
+                executable: argv[0].clone(),
+                arguments: argv[1..].to_vec(),
+                working_directory: Some(cwd),
+            },
+            retry: RetryPolicy {
+                limit: p.retry_limit,
+                ..Default::default()
+            },
+            attempt_timeout: p.attempt_timeout_ms.map(Duration::from_millis),
+            kill_grace: Duration::from_millis(p.kill_grace_ms.unwrap_or(1000)),
+            unobserved_grace: p.unobserved_grace_ms.map(Duration::from_millis),
+        },
+    })
+}
+async fn detach(app: &Arc<Mutex<Application>>, subs: &Subscribers, id: SubscriptionId) {
+    app.lock().await.disconnect(Duration::ZERO, id);
+    for values in subs.lock().await.values_mut() {
+        values.remove(&id);
+    }
+}
+fn apply_effects(
+    app: Arc<Mutex<Application>>,
+    subs: Subscribers,
+    attempts: Attempts,
+    effects: Vec<Effect>,
 ) {
-    match event {
-        Event::Acquire {
-            request,
-            client,
-            response,
-        } => {
-            let key = match ProcessKey::new(&request) {
-                Ok(key) => key,
-                Err(error) => {
-                    let _ = response.send(Err(error.to_string()));
-                    return;
-                }
-            };
-            if let Some(record) = records.get_mut(&key) {
-                record.timeout = Duration::from_millis(request.broker_timeout_ms);
-                let tail = record
-                    .history
-                    .iter()
-                    .skip(
-                        record
-                            .history
-                            .len()
-                            .saturating_sub(request.tail_lines.min(HISTORY_LINES)),
-                    )
-                    .cloned()
-                    .collect::<VecDeque<_>>();
-                if !send(&client, BrokerMessage::Attached { reused: true }) {
-                    let _ = response.send(Err("client disconnected while attaching".into()));
-                    return;
-                }
-                // Attached is in flight. Its writer acknowledgement starts
-                // replay, so live output cannot overtake the requested tail.
-                record.idle_generation = record.idle_generation.wrapping_add(1);
-                client_keys.insert(client.id, key.clone());
-                record
-                    .clients
-                    .insert(client.id, Delivery::replaying(client, tail));
-                let _ = response.send(Ok(()));
-                return;
+    for effect in effects {
+        match effect {
+            Effect::StartAttempt {
+                execution_id,
+                attempt_id,
+                definition,
+            } => {
+                tokio::spawn(run_attempt(
+                    app.clone(),
+                    subs.clone(),
+                    attempts.clone(),
+                    execution_id,
+                    attempt_id,
+                    definition,
+                ));
             }
-
-            match start_process(&key, &request, events.clone()).await {
-                Ok(process_group) => {
-                    if !send(&client, BrokerMessage::Attached { reused: false }) {
-                        tokio::spawn(terminate_process_group(process_group));
-                        let _ = response.send(Err("client disconnected while attaching".into()));
-                        return;
+            Effect::ScheduleRetry {
+                execution_id,
+                generation,
+                at,
+            } => {
+                let app = app.clone();
+                let subs = subs.clone();
+                let attempts = attempts.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(at).await;
+                    let effects = {
+                        let mut a = app.lock().await;
+                        let _ = a.retry_due(Duration::ZERO, execution_id, generation);
+                        a.take_effects()
+                    };
+                    apply_effects(app, subs, attempts.clone(), effects);
+                });
+            }
+            Effect::ScheduleUnobservedGrace {
+                execution_id,
+                generation,
+                at,
+            } => {
+                let app = app.clone();
+                let subs = subs.clone();
+                let attempts = attempts.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(at).await;
+                    let effects = {
+                        let mut a = app.lock().await;
+                        let _ = a.unobserved_grace_expired(execution_id, generation);
+                        a.take_effects()
+                    };
+                    apply_effects(app, subs, attempts.clone(), effects);
+                });
+            }
+            Effect::ScheduleAttemptTimeout {
+                execution_id,
+                attempt_id,
+                generation,
+                at,
+            } => {
+                let app = app.clone();
+                let subs = subs.clone();
+                let attempts = attempts.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(at).await;
+                    let effects = {
+                        let mut a = app.lock().await;
+                        let _ = a.attempt_timeout_expired(execution_id, attempt_id, generation);
+                        a.take_effects()
+                    };
+                    apply_effects(app, subs, attempts, effects);
+                });
+            }
+            Effect::CancelAttempt {
+                attempt_id,
+                kill_grace,
+                ..
+            } => {
+                let attempts = attempts.clone();
+                tokio::spawn(async move {
+                    if let Some(group) = attempts.lock().await.get(&attempt_id).copied() {
+                        terminate_process_group(group, kill_grace).await;
                     }
-                    let mut clients = HashMap::new();
-                    client_keys.insert(client.id, key.clone());
-                    clients.insert(client.id, Delivery::live(client));
-                    records.insert(
-                        key,
-                        ProcessRecord {
-                            timeout: Duration::from_millis(request.broker_timeout_ms),
-                            process_group,
-                            clients,
-                            history: VecDeque::new(),
-                            partial_stdout: Vec::new(),
-                            partial_stderr: Vec::new(),
-                            idle_generation: 0,
-                        },
-                    );
-                    let _ = response.send(Ok(()));
-                }
-                Err(error) => {
-                    let _ = response.send(Err(error.to_string()));
-                }
+                });
             }
         }
-        Event::Disconnect { key, client_id } => {
-            // Writer errors don't carry the key. They are harmless here; the
-            // reader's keyed disconnect follows when its socket is closed.
-            let Some(record) = records.get_mut(&key) else {
-                return;
-            };
-            client_keys.remove(&client_id);
-            if record.clients.remove(&client_id).is_some() && record.clients.is_empty() {
-                arm_idle(key, record, events.clone());
-            }
-        }
-        Event::Output { key, stream, data } => {
-            let Some(record) = records.get_mut(&key) else {
-                return;
-            };
-            let had_clients = !record.clients.is_empty();
-            append_history(record, stream, &data);
-            let output = OutputChunk::new(stream, &data);
-            let stale: Vec<_> = record
-                .clients
-                .iter_mut()
-                .filter_map(|(&id, delivery)| {
-                    (!delivery.enqueue(output.clone()) || !delivery.deliver_next()).then_some(id)
-                })
-                .collect();
-            for id in stale {
-                if let Some(delivery) = record.clients.remove(&id) {
-                    client_keys.remove(&id);
-                    close_client(&delivery.client);
-                }
-            }
-            if had_clients && record.clients.is_empty() {
-                arm_idle(key, record, events.clone());
-            }
-        }
-        Event::Exited { key, code, signal } => {
-            if let Some(record) = records.remove(&key) {
-                for (id, delivery) in record.clients {
-                    client_keys.remove(&id);
-                    if !send(&delivery.client, BrokerMessage::Exit { code, signal }) {
-                        close_client(&delivery.client);
-                    }
-                }
-            }
-        }
-        Event::IdleExpired { key, generation } => {
-            if let Some(record) = records.get(&key)
-                && record.clients.is_empty()
-                && record.idle_generation == generation
-            {
-                tokio::spawn(terminate_process_group(record.process_group));
-            }
-        }
-        Event::WriterReady { client_id } => {
-            let Some(key) = client_keys.get(&client_id).cloned() else {
-                return;
-            };
-            let Some(record) = records.get_mut(&key) else {
-                return;
-            };
-            let stale = record
-                .clients
-                .get_mut(&client_id)
-                .is_some_and(|delivery| !delivery.writer_ready());
-            if stale {
-                if let Some(delivery) = record.clients.remove(&client_id) {
-                    client_keys.remove(&client_id);
-                    close_client(&delivery.client);
-                }
-                if record.clients.is_empty() {
-                    arm_idle(key, record, events.clone());
-                }
-            }
-        }
-        Event::ConnectionClosed => unreachable!("handled by broker loop"),
     }
 }
-
-fn send(client: &Client, message: BrokerMessage) -> bool {
-    client.messages.try_send(message).is_ok()
-}
-
-fn close_client(client: &Client) {
-    let _ = client.close.send(());
-}
-
-fn arm_idle(key: ProcessKey, record: &mut ProcessRecord, events: mpsc::Sender<Event>) {
-    record.idle_generation = record.idle_generation.wrapping_add(1);
-    let generation = record.idle_generation;
-    let timeout = record.timeout;
-    tokio::spawn(async move {
-        tokio::time::sleep(timeout).await;
-        let _ = events.send(Event::IdleExpired { key, generation }).await;
-    });
-}
-
-async fn start_process(
-    key: &ProcessKey,
-    request: &AcquireRequest,
-    events: mpsc::Sender<Event>,
-) -> Result<i32> {
-    let mut command = Command::new(&request.argv[0]);
+async fn run_attempt(
+    app: Arc<Mutex<Application>>,
+    subs: Subscribers,
+    attempts: Attempts,
+    execution: ExecutionId,
+    attempt: AttemptId,
+    definition: ExecutionDefinition,
+) {
+    let mut command = Command::new(&definition.command.executable);
     command
-        .args(&request.argv[1..])
-        .current_dir(&request.cwd)
+        .args(&definition.command.arguments)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -640,198 +294,278 @@ async fn start_process(
             }
         });
     }
-    let mut child = command.spawn().context("start command")?;
-    let pid = child.id().context("started command has no pid")? as i32;
-    let stdout = child
-        .stdout
-        .take()
-        .context("command stdout was not captured")?;
-    let stderr = child
-        .stderr
-        .take()
-        .context("command stderr was not captured")?;
-    let output_events = events.clone();
-    let output_key = key.clone();
-    let stdout_task = tokio::spawn(read_output(
-        stdout,
-        output_key.clone(),
-        OutputStream::Stdout,
-        output_events.clone(),
-    ));
-    let stderr_task = tokio::spawn(read_output(
-        stderr,
-        output_key.clone(),
-        OutputStream::Stderr,
-        output_events,
-    ));
-    tokio::spawn(async move {
-        let status = child.wait().await;
-        let _ = stdout_task.await;
-        let _ = stderr_task.await;
-        let (code, signal) = match status {
-            Ok(status) => (status.code(), status.signal()),
-            Err(_) => (None, None),
-        };
-        let _ = events
-            .send(Event::Exited {
-                key: output_key,
-                code,
-                signal,
-            })
+    if let Some(cwd) = definition.command.working_directory {
+        command.current_dir(cwd);
+    }
+    let mut child = match command.spawn() {
+        Ok(c) => c,
+        Err(_) => {
+            complete(
+                app,
+                subs,
+                attempts,
+                execution,
+                attempt,
+                Outcome::Failed {
+                    exit_code: None,
+                    signal: None,
+                },
+            )
             .await;
-    });
-    Ok(pid)
-}
-
-async fn read_output<R: tokio::io::AsyncRead + Unpin>(
-    mut reader: R,
-    key: ProcessKey,
-    stream: OutputStream,
-    events: mpsc::Sender<Event>,
-) {
-    let mut buffer = vec![0; OUTPUT_CHUNK];
-    loop {
-        match reader.read(&mut buffer).await {
-            Ok(0) | Err(_) => break,
-            Ok(length) => {
-                if events
-                    .send(Event::Output {
-                        key: key.clone(),
-                        stream,
-                        data: buffer[..length].to_vec(),
-                    })
-                    .await
-                    .is_err()
-                {
+            return;
+        }
+    };
+    let Some(pid) = child.id() else {
+        complete(
+            app,
+            subs,
+            attempts,
+            execution,
+            attempt,
+            Outcome::Failed {
+                exit_code: None,
+                signal: None,
+            },
+        )
+        .await;
+        return;
+    };
+    attempts.lock().await.insert(attempt, pid as i32);
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let a = app.clone();
+    let s = subs.clone();
+    tokio::spawn(async move {
+        if let Some(mut r) = stdout.take() {
+            let mut b = vec![0; 8192];
+            while let Ok(n) = r.read(&mut b).await {
+                if n == 0 {
                     break;
                 }
+                publish_output(
+                    a.clone(),
+                    s.clone(),
+                    execution,
+                    attempt,
+                    OutputStream::Stdout,
+                    b[..n].to_vec(),
+                )
+                .await;
             }
         }
-    }
-}
-
-fn append_history(record: &mut ProcessRecord, stream: OutputStream, data: &[u8]) {
-    let partial = match stream {
-        OutputStream::Stdout => &mut record.partial_stdout,
-        OutputStream::Stderr => &mut record.partial_stderr,
+    });
+    let a = app.clone();
+    let s = subs.clone();
+    tokio::spawn(async move {
+        if let Some(mut r) = stderr.take() {
+            let mut b = vec![0; 8192];
+            while let Ok(n) = r.read(&mut b).await {
+                if n == 0 {
+                    break;
+                }
+                publish_output(
+                    a.clone(),
+                    s.clone(),
+                    execution,
+                    attempt,
+                    OutputStream::Stderr,
+                    b[..n].to_vec(),
+                )
+                .await;
+            }
+        }
+    });
+    let outcome = match child.wait().await {
+        Ok(status) if status.success() => Outcome::Succeeded,
+        Ok(status) => Outcome::Failed {
+            exit_code: status.code(),
+            signal: None,
+        },
+        Err(_) => Outcome::Failed {
+            exit_code: None,
+            signal: None,
+        },
     };
-    partial.extend_from_slice(data);
-    while let Some(end) = partial.iter().position(|byte| *byte == b'\n') {
-        let line: Vec<u8> = partial.drain(..=end).collect();
-        record.history.push_back(HistoryLine { stream, data: line });
-        if record.history.len() > HISTORY_LINES {
-            record.history.pop_front();
+    attempts.lock().await.remove(&attempt);
+    complete(app, subs, attempts, execution, attempt, outcome).await;
+}
+async fn publish_output(
+    app: Arc<Mutex<Application>>,
+    subs: Subscribers,
+    e: ExecutionId,
+    a: AttemptId,
+    stream: OutputStream,
+    data: Vec<u8>,
+) {
+    let events = {
+        let mut x = app.lock().await;
+        if !x.record_output(e, a, stream, data) {
+            return;
         }
+        x.events_since(e, 0)
+    };
+    broadcast(&subs, e, events.last().cloned().unwrap()).await;
+}
+async fn complete(
+    app: Arc<Mutex<Application>>,
+    subs: Subscribers,
+    attempts: Attempts,
+    e: ExecutionId,
+    a: AttemptId,
+    outcome: Outcome,
+) {
+    let events = {
+        let mut x = app.lock().await;
+        let cursor = x
+            .events_since(e, 0)
+            .last()
+            .map_or(0, |event| event.sequence);
+        if !x.complete_attempt(Duration::ZERO, e, a, outcome) {
+            return;
+        }
+        let effects = x.take_effects();
+        let events = x.events_since(e, cursor);
+        drop(x);
+        apply_effects(app.clone(), subs.clone(), attempts, effects);
+        events
+    };
+    for event in events {
+        broadcast(&subs, e, event).await;
     }
 }
+async fn broadcast(subs: &Subscribers, e: ExecutionId, event: StreamEvent) {
+    for out in subs
+        .lock()
+        .await
+        .get(&e)
+        .into_iter()
+        .flat_map(|x| x.values())
+    {
+        let _ = out.send(wire_event(e, event.clone()));
+    }
+}
+fn wire_event(execution: ExecutionId, event: StreamEvent) -> BrokerMessage {
+    let correlated_request = event.request_id.map(id_text).unwrap_or_default();
+    let (request, kind) = match event.event {
+        AppEvent::Output {
+            attempt_id,
+            stream,
+            data,
+        } => (
+            correlated_request.clone(),
+            LifecycleEventKind::Output {
+                attempt_id: id_text(attempt_id),
+                stream,
+                data_base64: encode_output(&data),
+            },
+        ),
+        AppEvent::Execution {
+            execution_id,
+            state,
+            outcome,
+        } => (
+            correlated_request.clone(),
+            match state {
+                ExecutionState::Running => LifecycleEventKind::ExecutionCreated,
+                ExecutionState::Cancelling => LifecycleEventKind::ExecutionCancelling {
+                    reason: "cancelled".into(),
+                },
+                _ => LifecycleEventKind::ExecutionCompleted {
+                    outcome: outcome
+                        .map(wire_outcome)
+                        .unwrap_or(WireOutcome::Cancelled { reason: None }),
+                },
+            },
+        ),
+        AppEvent::Attempt {
+            attempt_id,
+            outcome,
+            ..
+        } => (
+            correlated_request.clone(),
+            LifecycleEventKind::AttemptCompleted {
+                attempt_id: id_text(attempt_id),
+                outcome: wire_outcome(outcome),
+            },
+        ),
+        AppEvent::Request {
+            request_id,
+            state,
+            outcome,
+        } => {
+            let kind = match (state, outcome) {
+                (
+                    RequestState::Succeeded
+                    | RequestState::Failed
+                    | RequestState::TimedOut
+                    | RequestState::Cancelled,
+                    Some(outcome),
+                ) => LifecycleEventKind::RequestCompleted {
+                    outcome: wire_outcome(outcome),
+                },
+                (RequestState::Attached, _) => LifecycleEventKind::RequestAttached,
+                (RequestState::Pending, _) => LifecycleEventKind::RequestPending,
+                (RequestState::Assigned, _) => LifecycleEventKind::RequestAssigned,
+                (RequestState::Dropped, Some(Outcome::Dropped { reason })) => {
+                    LifecycleEventKind::RequestDropped { reason }
+                }
+                (RequestState::Superseded, Some(Outcome::Superseded { by })) => {
+                    LifecycleEventKind::RequestSuperseded {
+                        by_request_id: id_text(by),
+                    }
+                }
+                (RequestState::Rejected, Some(Outcome::Rejected { reason })) => {
+                    LifecycleEventKind::RequestRejected { reason }
+                }
+                _ => LifecycleEventKind::RequestReceived,
+            };
+            (id_text(request_id), kind)
+        }
+    };
+    BrokerMessage::Event {
+        event: crate::protocol::LifecycleEvent {
+            sequence: event.sequence,
+            request_id: request,
+            execution_id: Some(id_text(execution)),
+            kind,
+        },
+    }
+}
+fn wire_outcome(o: Outcome) -> WireOutcome {
+    match o {
+        Outcome::Succeeded => WireOutcome::Succeeded,
+        Outcome::Failed { exit_code, signal } => WireOutcome::Failed {
+            code: exit_code,
+            signal,
+        },
+        Outcome::TimedOut => WireOutcome::TimedOut,
+        Outcome::Cancelled => WireOutcome::Cancelled { reason: None },
+        Outcome::Dropped { reason } => WireOutcome::Dropped { reason },
+        Outcome::Superseded { by } => WireOutcome::Superseded {
+            by_request_id: id_text(by),
+        },
+        Outcome::Rejected { reason } => WireOutcome::Rejected { reason },
+    }
+}
+trait IdText {
+    fn text(self) -> String;
+}
+macro_rules! id_text { ($($type:ty),* $(,)?) => { $(impl IdText for $type { fn text(self) -> String { self.0.to_string() } })* }; }
+id_text!(RequestId, ExecutionId, AttemptId, SubscriptionId);
+fn id_text<T: IdText>(id: T) -> String {
+    id.text()
+}
+fn parse_id(text: &str) -> Option<RequestId> {
+    text.parse().ok().map(RequestId)
+}
 
-fn signal_process_group(process_group: i32, signal: i32) {
+fn signal_process_group(group: i32, signal: i32) {
     unsafe {
-        libc::kill(-process_group, signal);
+        libc::kill(-group, signal);
     }
 }
-
-async fn terminate_process_group(process_group: i32) {
-    signal_process_group(process_group, libc::SIGTERM);
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    signal_process_group(process_group, libc::SIGKILL);
-}
-
-async fn terminate_all(process_groups: impl Iterator<Item = i32>) {
-    let process_groups: Vec<_> = process_groups.collect();
-    for process_group in &process_groups {
-        signal_process_group(*process_group, libc::SIGTERM);
-    }
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    for process_group in process_groups {
-        signal_process_group(process_group, libc::SIGKILL);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn replays_more_chunks_than_the_writer_queue() {
-        let (messages, mut outbound) = mpsc::channel(CLIENT_WRITER_QUEUE);
-        let (close, _) = mpsc::unbounded_channel();
-        let chunks = 65;
-        let lines = (0..chunks)
-            .map(|_| HistoryLine {
-                stream: OutputStream::Stdout,
-                data: vec![b'x'; OUTPUT_CHUNK],
-            })
-            .collect();
-        let mut delivery = Delivery::replaying(
-            Client {
-                id: 1,
-                messages,
-                close,
-            },
-            lines,
-        );
-
-        for _ in 0..chunks {
-            assert!(delivery.writer_ready());
-            assert!(matches!(
-                outbound.recv().await,
-                Some(BrokerMessage::Output { .. })
-            ));
-        }
-        assert!(delivery.writer_ready());
-        assert!(outbound.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn delivers_live_output_after_replay() {
-        let (messages, mut outbound) = mpsc::channel(CLIENT_WRITER_QUEUE);
-        let (close, _) = mpsc::unbounded_channel();
-        let mut delivery = Delivery::replaying(
-            Client {
-                id: 1,
-                messages,
-                close,
-            },
-            VecDeque::from([HistoryLine {
-                stream: OutputStream::Stdout,
-                data: b"history\n".to_vec(),
-            }]),
-        );
-        assert!(delivery.enqueue(OutputChunk::new(OutputStream::Stdout, b"live\n")));
-
-        assert!(delivery.writer_ready());
-        let BrokerMessage::Output { data_base64, .. } = outbound.recv().await.unwrap() else {
-            panic!("expected replay output");
-        };
-        assert_eq!(protocol::decode_output(&data_base64).unwrap(), b"history\n");
-
-        assert!(delivery.writer_ready());
-        let BrokerMessage::Output { data_base64, .. } = outbound.recv().await.unwrap() else {
-            panic!("expected live output");
-        };
-        assert_eq!(protocol::decode_output(&data_base64).unwrap(), b"live\n");
-    }
-
-    #[test]
-    fn bounds_pending_live_output_by_wire_bytes() {
-        let (messages, _) = mpsc::channel(CLIENT_WRITER_QUEUE);
-        let (close, _) = mpsc::unbounded_channel();
-        let mut delivery = Delivery::live(Client {
-            id: 1,
-            messages,
-            close,
-        });
-        let output = OutputChunk::new(OutputStream::Stdout, &vec![b'x'; OUTPUT_CHUNK]);
-
-        while delivery.enqueue(output.clone()) {}
-
-        let pending_bytes = match &delivery.state {
-            DeliveryState::Live { pending } | DeliveryState::Replaying { pending, .. } => {
-                pending.wire_bytes
-            }
-        };
-        assert!(pending_bytes <= CLIENT_BACKLOG_BYTES);
-        assert!(!delivery.enqueue(output));
-    }
+async fn terminate_process_group(group: i32, kill_grace: Duration) {
+    signal_process_group(group, libc::SIGTERM);
+    tokio::time::sleep(kill_grace).await;
+    signal_process_group(group, libc::SIGKILL);
 }

@@ -13,8 +13,8 @@ use tokio::net::UnixStream;
 use tokio::time::{Instant, sleep};
 
 use crate::protocol::{
-    BrokerMessage, ClientMessage, OutputStream, ProtocolError, decode_output, read_frame,
-    write_frame,
+    BrokerMessage, ClientMessage, LifecycleEventKind, OutputStream, ProtocolError, SubmitPolicies,
+    WireOutcome, decode_output, read_frame, write_frame,
 };
 
 const STARTUP_DEADLINE: Duration = Duration::from_secs(2);
@@ -33,25 +33,29 @@ pub async fn run(options: ClientOptions) -> Result<()> {
     let runtime_dir = runtime_dir()?;
     let socket = runtime_dir.join("broker.sock");
     check_socket_path(&socket)?;
-    let broker_timeout_ms = options
+    let unobserved_grace_ms = options
         .broker_timeout
         .as_millis()
         .try_into()
         .map_err(|_| anyhow!("--broker-timeout is too large"))?;
-    let acquire = ClientMessage::Acquire {
+    let submit = ClientMessage::Submit {
         cwd: cwd.to_string_lossy().into_owned(),
         argv: options.argv,
-        tail_lines: options.tail_lines,
-        broker_timeout_ms,
+        key: None,
+        group: None,
+        policies: SubmitPolicies {
+            unobserved_grace_ms: Some(unobserved_grace_ms),
+            ..SubmitPolicies::default()
+        },
     };
     let deadline = Instant::now() + STARTUP_DEADLINE;
     let mut last_error = None;
 
     loop {
         let mut stream = connect_or_start(&runtime_dir, &socket).await?;
-        match send_acquire_and_wait_for_attach(&mut stream, &acquire).await? {
-            AcquireResult::Attached => return stream_messages(&mut stream).await,
-            AcquireResult::ConnectionClosed(error) => {
+        match send_submit_and_subscribe(&mut stream, &submit).await? {
+            SubmitResult::Subscribed => return stream_messages(&mut stream).await,
+            SubmitResult::ConnectionClosed(error) => {
                 last_error = Some(error);
                 if Instant::now() >= deadline {
                     bail!(
@@ -66,35 +70,54 @@ pub async fn run(options: ClientOptions) -> Result<()> {
     }
 }
 
-enum AcquireResult {
-    Attached,
+enum SubmitResult {
+    Subscribed,
     /// The broker can close a just-established connection while it exits. No
     /// acquire was acknowledged, so it is safe to connect again.
     ConnectionClosed(ProtocolError),
 }
 
-async fn send_acquire_and_wait_for_attach<S>(
+async fn send_submit_and_subscribe<S>(
     stream: &mut S,
-    acquire: &ClientMessage,
-) -> Result<AcquireResult>
+    submit: &ClientMessage,
+) -> Result<SubmitResult>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    if let Err(error) = write_frame(stream, acquire).await {
+    if let Err(error) = write_frame(stream, submit).await {
         return match error {
             ProtocolError::Io(error) => {
-                Ok(AcquireResult::ConnectionClosed(ProtocolError::Io(error)))
+                Ok(SubmitResult::ConnectionClosed(ProtocolError::Io(error)))
             }
-            error => Err(error).context("could not send acquire request"),
+            error => Err(error).context("could not send submit request"),
         };
     }
 
     match read_frame::<_, BrokerMessage>(stream).await {
-        Ok(BrokerMessage::Attached { .. }) => Ok(AcquireResult::Attached),
+        Ok(BrokerMessage::Submitted { request_id, .. }) => {
+            write_frame(
+                stream,
+                &ClientMessage::Subscribe {
+                    request_id,
+                    after: None,
+                },
+            )
+            .await
+            .context("could not subscribe to submitted request")?;
+            match read_frame::<_, BrokerMessage>(stream).await {
+                Ok(BrokerMessage::Subscribed { .. }) => Ok(SubmitResult::Subscribed),
+                Ok(BrokerMessage::Error { message }) => bail!("broker: {message}"),
+                Ok(message) => bail!("broker sent {message:?} before subscription acknowledgement"),
+                Err(ProtocolError::Io(error)) => {
+                    Ok(SubmitResult::ConnectionClosed(ProtocolError::Io(error)))
+                }
+                Err(error) => Err(error).context("broker sent an invalid subscription response"),
+            }
+        }
         Ok(BrokerMessage::Error { message }) => bail!("broker: {message}"),
-        Ok(message) => bail!("broker sent {message:?} before attached"),
+        Ok(message) => bail!("broker sent {message:?} before submit acknowledgement"),
         Err(ProtocolError::Io(error)) => {
-            Ok(AcquireResult::ConnectionClosed(ProtocolError::Io(error)))
+            Ok(SubmitResult::ConnectionClosed(ProtocolError::Io(error)))
         }
         Err(error) => Err(error).context("broker sent an invalid response"),
     }
@@ -257,8 +280,8 @@ async fn stream_messages(stream: &mut UnixStream) -> Result<()> {
             result = read_frame::<_, BrokerMessage>(stream) => {
                 let message = result.context("broker connection closed unexpectedly")?;
                 match message {
-                    BrokerMessage::Attached { .. } => {},
-                    BrokerMessage::Output { stream, data_base64 } => {
+                    BrokerMessage::Event { event } => match event.kind {
+                    LifecycleEventKind::Output { stream, data_base64, .. } => {
                         let data = decode_output(&data_base64)
                             .context("broker sent invalid output encoding")?;
                         use std::io::Write;
@@ -271,10 +294,10 @@ async fn stream_messages(stream: &mut UnixStream) -> Result<()> {
                             OutputStream::Stderr => std::io::stderr().flush(),
                         }.context("could not flush command output")?;
                     },
-                    BrokerMessage::Exit { code, signal } => {
-                        let status = code.or_else(|| signal.map(|number| 128 + number)).unwrap_or(1);
-                        std::process::exit(status);
+                    LifecycleEventKind::RequestCompleted { outcome } => std::process::exit(outcome_status(outcome)),
+                    _ => {},
                     },
+                    BrokerMessage::Submitted { .. } | BrokerMessage::Subscribed { .. } | BrokerMessage::Cancelled { .. } | BrokerMessage::Unsubscribed { .. } => {},
                     BrokerMessage::Error { message } => bail!("broker: {message}"),
                 }
             }
@@ -291,6 +314,25 @@ async fn stream_messages(stream: &mut UnixStream) -> Result<()> {
                 std::process::exit(143);
             }
         }
+    }
+}
+
+fn outcome_status(outcome: WireOutcome) -> i32 {
+    match outcome {
+        WireOutcome::Succeeded => 0,
+        WireOutcome::Failed {
+            code: Some(code), ..
+        } => code,
+        WireOutcome::Failed {
+            signal: Some(signal),
+            ..
+        } => 128 + signal,
+        WireOutcome::TimedOut => 124,
+        WireOutcome::Cancelled { .. } => 130,
+        WireOutcome::Dropped { .. }
+        | WireOutcome::Superseded { .. }
+        | WireOutcome::Rejected { .. }
+        | WireOutcome::Failed { .. } => 1,
     }
 }
 
@@ -315,23 +357,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retries_when_broker_closes_before_attaching() {
+    async fn retries_when_broker_closes_before_submit_is_acknowledged() {
         let (mut stream, mut broker) = duplex(4096);
         let server = tokio::spawn(async move {
             let _: ClientMessage = read_frame(&mut broker).await.unwrap();
         });
-        let acquire = ClientMessage::Acquire {
+        let submit = ClientMessage::Submit {
             cwd: "/tmp".into(),
             argv: vec!["command".into()],
-            tail_lines: 0,
-            broker_timeout_ms: 1,
+            key: None,
+            group: None,
+            policies: SubmitPolicies::default(),
         };
 
         assert!(matches!(
-            send_acquire_and_wait_for_attach(&mut stream, &acquire)
+            send_submit_and_subscribe(&mut stream, &submit)
                 .await
                 .unwrap(),
-            AcquireResult::ConnectionClosed(ProtocolError::Io(_))
+            SubmitResult::ConnectionClosed(ProtocolError::Io(_))
         ));
         server.await.unwrap();
     }
