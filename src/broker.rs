@@ -14,10 +14,13 @@ use tokio::{
     net::{UnixListener, UnixStream},
     process::Command,
     sync::{Mutex, mpsc},
+    time::{Instant, sleep_until},
 };
 
 type Outbound = mpsc::UnboundedSender<BrokerMessage>;
-type Subscribers = Arc<Mutex<HashMap<ExecutionId, HashMap<SubscriptionId, Outbound>>>>;
+// Subscriptions are request-owned.  A request may be pending when its client
+// subscribes, long before it has an execution to key a transport map by.
+type Subscribers = Arc<Mutex<HashMap<RequestId, HashMap<SubscriptionId, Outbound>>>>;
 type Attempts = Arc<Mutex<HashMap<AttemptId, i32>>>;
 
 pub async fn run(socket: PathBuf) -> Result<()> {
@@ -26,6 +29,7 @@ pub async fn run(socket: PathBuf) -> Result<()> {
     let app = Arc::new(Mutex::new(Application::new()));
     let subscribers = Arc::new(Mutex::new(HashMap::new()));
     let attempts = Arc::new(Mutex::new(HashMap::new()));
+    let clock = Instant::now();
     let mut next_subscription = 1_u64;
     loop {
         let (stream, _) = listener.accept().await.context("accept broker client")?;
@@ -37,6 +41,7 @@ pub async fn run(socket: PathBuf) -> Result<()> {
             Arc::clone(&app),
             Arc::clone(&subscribers),
             Arc::clone(&attempts),
+            clock,
         ));
     }
 }
@@ -47,6 +52,7 @@ async fn handle(
     app: Arc<Mutex<Application>>,
     subscribers: Subscribers,
     attempts: Attempts,
+    clock: Instant,
 ) {
     let (mut reader, mut writer) = stream.into_split();
     let (out, mut rx) = mpsc::unbounded_channel();
@@ -75,7 +81,7 @@ async fn handle(
                         continue;
                     }
                 };
-                let (result, effects) = {
+                let (result, effects, terminals) = {
                     let mut a = app.lock().await;
                     let scope = PolicyScopeId::for_key(&submit.key, submit.group.clone());
                     a.configure_scope_patch(
@@ -84,14 +90,21 @@ async fn handle(
                         scope_settings.max_concurrency,
                         scope_settings.rate_limit,
                     );
-                    let r = a.submit(Duration::ZERO, submit);
-                    (r, a.take_effects())
+                    let r = a.submit(clock.elapsed(), submit);
+                    (r, a.take_effects(), a.take_request_terminals())
                 };
                 let _ = out.send(BrokerMessage::Submitted {
                     request_id: id_text(result.request_id),
                     execution_id: result.execution_id.map(id_text),
                 });
-                apply_effects(app.clone(), subscribers.clone(), attempts.clone(), effects);
+                broadcast_request_terminals(&subscribers, terminals).await;
+                apply_effects(
+                    app.clone(),
+                    subscribers.clone(),
+                    attempts.clone(),
+                    clock,
+                    effects,
+                );
             }
             ClientMessage::Subscribe { request_id, after } => match parse_id(&request_id) {
                 Some(request) => {
@@ -99,20 +112,40 @@ async fn handle(
                         let mut a = app.lock().await;
                         a.subscribe_with_replay(request, id, after.unwrap_or(0))
                     };
-                    if let Some((execution, replay)) = subscribed {
-                        subscribers
-                            .lock()
-                            .await
-                            .entry(execution)
-                            .or_default()
-                            .insert(id, out.clone());
+                    if let Some(subscription) = subscribed {
+                        let (execution_id, replay, terminal) = match subscription {
+                            crate::application::SubscriptionReplay::Pending => (None, vec![], None),
+                            crate::application::SubscriptionReplay::Execution {
+                                execution_id,
+                                replay,
+                            } => (Some(execution_id), replay, None),
+                            crate::application::SubscriptionReplay::Terminal { outcome } => {
+                                (None, vec![], Some(outcome))
+                            }
+                        };
+                        if terminal.is_none() {
+                            subscribers
+                                .lock()
+                                .await
+                                .entry(request)
+                                .or_default()
+                                .insert(id, out.clone());
+                        }
                         let _ = out.send(BrokerMessage::Subscribed {
                             subscription_id: id_text(id),
-                            request_id,
-                            execution_id: Some(id_text(execution)),
+                            request_id: request_id.clone(),
+                            execution_id: execution_id.map(id_text),
                         });
+                        if let Some(outcome) = terminal {
+                            for message in terminal_request_messages(request, outcome) {
+                                let _ = out.send(message);
+                            }
+                        }
                         for event in replay {
-                            let _ = out.send(wire_event(execution, event));
+                            let _ = out.send(wire_event(
+                                execution_id.expect("replay has execution"),
+                                event,
+                            ));
                         }
                     } else {
                         let _ = out.send(BrokerMessage::Error {
@@ -128,25 +161,36 @@ async fn handle(
             },
             ClientMessage::CancelRequest { request_id } => {
                 if let Some(request) = parse_id(&request_id) {
-                    let (ok, effects) = {
+                    let (ok, effects, terminals) = {
                         let mut a = app.lock().await;
-                        (a.cancel_request(Duration::ZERO, request), a.take_effects())
+                        (
+                            a.cancel_request(clock.elapsed(), request),
+                            a.take_effects(),
+                            a.take_request_terminals(),
+                        )
                     };
                     if ok {
                         let _ = out.send(BrokerMessage::Cancelled { request_id });
-                        apply_effects(app.clone(), subscribers.clone(), attempts.clone(), effects);
+                        broadcast_request_terminals(&subscribers, terminals).await;
+                        apply_effects(
+                            app.clone(),
+                            subscribers.clone(),
+                            attempts.clone(),
+                            clock,
+                            effects,
+                        );
                     }
                 }
             }
             ClientMessage::Unsubscribe { subscription_id } => {
                 if subscription_id == id_text(id) {
-                    detach(&app, &subscribers, id).await;
+                    detach(&app, &subscribers, id, clock).await;
                     let _ = out.send(BrokerMessage::Unsubscribed { subscription_id });
                 }
             }
         }
     }
-    detach(&app, &subscribers, id).await;
+    detach(&app, &subscribers, id, clock).await;
     writer_task.abort();
 }
 
@@ -215,8 +259,13 @@ fn make_submit(
         scope_settings,
     ))
 }
-async fn detach(app: &Arc<Mutex<Application>>, subs: &Subscribers, id: SubscriptionId) {
-    app.lock().await.disconnect(Duration::ZERO, id);
+async fn detach(
+    app: &Arc<Mutex<Application>>,
+    subs: &Subscribers,
+    id: SubscriptionId,
+    clock: Instant,
+) {
+    app.lock().await.disconnect(clock.elapsed(), id);
     for values in subs.lock().await.values_mut() {
         values.remove(&id);
     }
@@ -225,6 +274,7 @@ fn apply_effects(
     app: Arc<Mutex<Application>>,
     subs: Subscribers,
     attempts: Attempts,
+    clock: Instant,
     effects: Vec<Effect>,
 ) {
     for effect in effects {
@@ -241,6 +291,7 @@ fn apply_effects(
                     execution_id,
                     attempt_id,
                     definition,
+                    clock,
                 ));
             }
             Effect::ScheduleRetry {
@@ -252,13 +303,13 @@ fn apply_effects(
                 let subs = subs.clone();
                 let attempts = attempts.clone();
                 tokio::spawn(async move {
-                    tokio::time::sleep(at).await;
+                    sleep_until(clock + at).await;
                     let effects = {
                         let mut a = app.lock().await;
-                        let _ = a.retry_due(Duration::ZERO, execution_id, generation);
+                        let _ = a.retry_due(clock.elapsed(), execution_id, generation);
                         a.take_effects()
                     };
-                    apply_effects(app, subs, attempts.clone(), effects);
+                    apply_effects(app, subs, attempts.clone(), clock, effects);
                 });
             }
             Effect::ScheduleUnobservedGrace {
@@ -270,13 +321,13 @@ fn apply_effects(
                 let subs = subs.clone();
                 let attempts = attempts.clone();
                 tokio::spawn(async move {
-                    tokio::time::sleep(at).await;
+                    sleep_until(clock + at).await;
                     let effects = {
                         let mut a = app.lock().await;
                         let _ = a.unobserved_grace_expired(execution_id, generation);
                         a.take_effects()
                     };
-                    apply_effects(app, subs, attempts.clone(), effects);
+                    apply_effects(app, subs, attempts.clone(), clock, effects);
                 });
             }
             Effect::ScheduleAttemptTimeout {
@@ -289,13 +340,27 @@ fn apply_effects(
                 let subs = subs.clone();
                 let attempts = attempts.clone();
                 tokio::spawn(async move {
-                    tokio::time::sleep(at).await;
+                    sleep_until(clock + at).await;
                     let effects = {
                         let mut a = app.lock().await;
                         let _ = a.attempt_timeout_expired(execution_id, attempt_id, generation);
                         a.take_effects()
                     };
-                    apply_effects(app, subs, attempts, effects);
+                    apply_effects(app, subs, attempts, clock, effects);
+                });
+            }
+            Effect::ScheduleAdmission { scope, at } => {
+                let app = app.clone();
+                let subs = subs.clone();
+                let attempts = attempts.clone();
+                tokio::spawn(async move {
+                    sleep_until(clock + at).await;
+                    let effects = {
+                        let mut a = app.lock().await;
+                        a.reconsider_scope(clock.elapsed(), scope);
+                        a.take_effects()
+                    };
+                    apply_effects(app, subs, attempts, clock, effects);
                 });
             }
             Effect::CancelAttempt {
@@ -320,6 +385,7 @@ async fn run_attempt(
     execution: ExecutionId,
     attempt: AttemptId,
     definition: ExecutionDefinition,
+    clock: Instant,
 ) {
     let mut command = Command::new(&definition.command.executable);
     command
@@ -352,6 +418,7 @@ async fn run_attempt(
                     exit_code: None,
                     signal: None,
                 },
+                clock,
             )
             .await;
             return;
@@ -368,6 +435,7 @@ async fn run_attempt(
                 exit_code: None,
                 signal: None,
             },
+            clock,
         )
         .await;
         return;
@@ -429,7 +497,7 @@ async fn run_attempt(
         },
     };
     attempts.lock().await.remove(&attempt);
-    complete(app, subs, attempts, execution, attempt, outcome).await;
+    complete(app, subs, attempts, execution, attempt, outcome, clock).await;
 }
 async fn publish_output(
     app: Arc<Mutex<Application>>,
@@ -446,7 +514,7 @@ async fn publish_output(
         }
         x.events_since(e, 0)
     };
-    broadcast(&subs, e, events.last().cloned().unwrap()).await;
+    broadcast(&app, &subs, e, events.last().cloned().unwrap()).await;
 }
 async fn complete(
     app: Arc<Mutex<Application>>,
@@ -455,6 +523,7 @@ async fn complete(
     e: ExecutionId,
     a: AttemptId,
     outcome: Outcome,
+    clock: Instant,
 ) {
     let events = {
         let mut x = app.lock().await;
@@ -462,29 +531,89 @@ async fn complete(
             .events_since(e, 0)
             .last()
             .map_or(0, |event| event.sequence);
-        if !x.complete_attempt(Duration::ZERO, e, a, outcome) {
+        if !x.complete_attempt(clock.elapsed(), e, a, outcome) {
             return;
         }
         let effects = x.take_effects();
         let events = x.events_since(e, cursor);
         drop(x);
-        apply_effects(app.clone(), subs.clone(), attempts, effects);
+        apply_effects(app.clone(), subs.clone(), attempts, clock, effects);
         events
     };
     for event in events {
-        broadcast(&subs, e, event).await;
+        broadcast(&app, &subs, e, event).await;
     }
 }
-async fn broadcast(subs: &Subscribers, e: ExecutionId, event: StreamEvent) {
-    for out in subs
-        .lock()
-        .await
-        .get(&e)
-        .into_iter()
+async fn broadcast(
+    app: &Arc<Mutex<Application>>,
+    subs: &Subscribers,
+    e: ExecutionId,
+    event: StreamEvent,
+) {
+    let requests = app.lock().await.requests_for_execution(e);
+    let subscribers = subs.lock().await;
+    for out in requests
+        .iter()
+        .filter_map(|request| subscribers.get(request))
         .flat_map(|x| x.values())
     {
         let _ = out.send(wire_event(e, event.clone()));
     }
+}
+async fn broadcast_request_terminals(
+    subs: &Subscribers,
+    terminals: Vec<crate::application::RequestTerminalEvent>,
+) {
+    let subscribers = subs.lock().await;
+    for terminal in terminals {
+        if let Some(outputs) = subscribers.get(&terminal.request_id) {
+            for out in outputs.values() {
+                for message in
+                    terminal_request_messages(terminal.request_id, terminal.outcome.clone())
+                {
+                    let _ = out.send(message);
+                }
+            }
+        }
+    }
+}
+fn terminal_request_messages(request: RequestId, outcome: Outcome) -> Vec<BrokerMessage> {
+    let request_id = id_text(request);
+    let lifecycle = match &outcome {
+        Outcome::Dropped { reason } => LifecycleEventKind::RequestDropped {
+            reason: reason.clone(),
+        },
+        Outcome::Superseded { by } => LifecycleEventKind::RequestSuperseded {
+            by_request_id: id_text(*by),
+        },
+        Outcome::Rejected { reason } => LifecycleEventKind::RequestRejected {
+            reason: reason.clone(),
+        },
+        Outcome::Cancelled => LifecycleEventKind::ExecutionCancelling {
+            reason: "cancelled".into(),
+        },
+        _ => LifecycleEventKind::RequestReceived,
+    };
+    vec![
+        BrokerMessage::Event {
+            event: crate::protocol::LifecycleEvent {
+                sequence: 1,
+                request_id: request_id.clone(),
+                execution_id: None,
+                kind: lifecycle,
+            },
+        },
+        BrokerMessage::Event {
+            event: crate::protocol::LifecycleEvent {
+                sequence: 2,
+                request_id,
+                execution_id: None,
+                kind: LifecycleEventKind::RequestCompleted {
+                    outcome: wire_outcome(outcome),
+                },
+            },
+        },
+    ]
 }
 fn wire_event(execution: ExecutionId, event: StreamEvent) -> BrokerMessage {
     let correlated_request = event.request_id.map(id_text).unwrap_or_default();

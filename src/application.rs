@@ -20,6 +20,24 @@ pub struct SubmitResult {
     pub request_id: RequestId,
     pub execution_id: Option<ExecutionId>,
 }
+/// A request that ended without ever belonging to an execution.  These still
+/// need terminal delivery to request subscribers (for example `drop`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequestTerminalEvent {
+    pub request_id: RequestId,
+    pub outcome: Outcome,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SubscriptionReplay {
+    Pending,
+    Execution {
+        execution_id: ExecutionId,
+        replay: Vec<StreamEvent>,
+    },
+    Terminal {
+        outcome: Outcome,
+    },
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Effect {
     StartAttempt {
@@ -46,6 +64,10 @@ pub enum Effect {
     ScheduleUnobservedGrace {
         execution_id: ExecutionId,
         generation: u64,
+        at: Duration,
+    },
+    ScheduleAdmission {
+        scope: PolicyScopeId,
         at: Duration,
     },
 }
@@ -95,6 +117,7 @@ pub struct Application {
     unobserved_generation: HashMap<ExecutionId, u64>,
     timeout_generation: HashMap<AttemptId, u64>,
     forced_outcomes: HashMap<AttemptId, Outcome>,
+    request_terminals: Vec<RequestTerminalEvent>,
 }
 
 impl Default for Application {
@@ -118,6 +141,7 @@ impl Application {
             unobserved_generation: HashMap::new(),
             timeout_generation: HashMap::new(),
             forced_outcomes: HashMap::new(),
+            request_terminals: vec![],
         }
     }
     pub fn configure_scope(&mut self, id: PolicyScopeId, policy: ScopePolicy) {
@@ -168,6 +192,9 @@ impl Application {
     }
     pub fn take_effects(&mut self) -> Vec<Effect> {
         std::mem::take(&mut self.effects)
+    }
+    pub fn take_request_terminals(&mut self) -> Vec<RequestTerminalEvent> {
+        std::mem::take(&mut self.request_terminals)
     }
     pub fn events_since(&self, execution: ExecutionId, cursor: u64) -> Vec<StreamEvent> {
         self.streams
@@ -234,6 +261,12 @@ impl Application {
                 self.requests
                     .reject(id, "key is bound to another active scope")
                     .unwrap();
+                self.request_terminals.push(RequestTerminalEvent {
+                    request_id: id,
+                    outcome: Outcome::Rejected {
+                        reason: "key is bound to another active scope".into(),
+                    },
+                });
                 return SubmitResult {
                     request_id: id,
                     execution_id: None,
@@ -282,6 +315,12 @@ impl Application {
                 self.requests
                     .drop(id, "contention policy dropped request")
                     .unwrap();
+                self.request_terminals.push(RequestTerminalEvent {
+                    request_id: id,
+                    outcome: Outcome::Dropped {
+                        reason: "contention policy dropped request".into(),
+                    },
+                });
             }
             ContentionDecision::Replace(e) => {
                 self.pend(id);
@@ -322,6 +361,10 @@ impl Application {
                 self.scopes.remove_pending(&scope, id).unwrap();
                 self.keys.decrement_pending(&key).unwrap();
                 self.requests.supersede(id, by).unwrap();
+                self.request_terminals.push(RequestTerminalEvent {
+                    request_id: id,
+                    outcome: Outcome::Superseded { by },
+                });
             }
         }
     }
@@ -345,11 +388,21 @@ impl Application {
                     now,
                 )
             };
-            if !matches!(decision, AdmissionDecision::Admit) {
-                return;
+            match decision {
+                AdmissionDecision::Admit => self.start(now, id),
+                AdmissionDecision::BlockOnCapacity => return,
+                AdmissionDecision::BlockUntil(at) => {
+                    self.effects.push(Effect::ScheduleAdmission {
+                        scope: scope.clone(),
+                        at,
+                    });
+                    return;
+                }
             }
-            self.start(now, id);
         }
+    }
+    pub fn reconsider_scope(&mut self, now: Duration, scope: PolicyScopeId) {
+        self.reconsider(now, &scope);
     }
     fn start(&mut self, now: Duration, id: RequestId) {
         let (key, scope) = {
@@ -545,6 +598,10 @@ impl Application {
                 self.scopes.remove_pending(&scope, id).unwrap();
                 self.keys.decrement_pending(&key).unwrap();
                 self.requests.cancel(id).unwrap();
+                self.request_terminals.push(RequestTerminalEvent {
+                    request_id: id,
+                    outcome: Outcome::Cancelled,
+                });
                 true
             }
             RequestState::Attached | RequestState::Assigned => {
@@ -680,9 +737,31 @@ impl Application {
         request: RequestId,
         subscription: SubscriptionId,
         cursor: u64,
-    ) -> Option<(ExecutionId, Vec<StreamEvent>)> {
-        let execution = self.subscribe(request, subscription)?;
-        Some((execution, self.events_since(execution, cursor)))
+    ) -> Option<SubscriptionReplay> {
+        // A subscription is to a *request*, not merely an already-created
+        // execution.  In particular, a queued request must be observable
+        // before admission creates its execution.
+        self.requests.subscribe(request, subscription).ok()?;
+        let record = self.requests.get(request)?;
+        if record.state.is_terminal() && record.execution_id.is_none() {
+            return record
+                .outcome
+                .clone()
+                .map(|outcome| SubscriptionReplay::Terminal { outcome });
+        }
+        let execution = record.execution_id;
+        if let Some(execution) = execution {
+            self.unobserved_generation
+                .entry(execution)
+                .and_modify(|generation| *generation += 1)
+                .or_insert(1);
+            Some(SubscriptionReplay::Execution {
+                execution_id: execution,
+                replay: self.events_since(execution, cursor),
+            })
+        } else {
+            Some(SubscriptionReplay::Pending)
+        }
     }
 
     fn schedule_attempt_timeout(
@@ -772,6 +851,80 @@ mod tests {
         let at = a.execution(e).unwrap().attempts[0];
         a.complete_attempt(Duration::from_secs(2), e, at, Outcome::Succeeded);
         assert_eq!(a.request_state(r2.request_id), Some(RequestState::Assigned));
+    }
+
+    #[test]
+    fn pending_request_can_subscribe_before_admission() {
+        let mut a = Application::new();
+        let group = GroupId::from("g");
+        a.configure_scope(
+            PolicyScopeId::Group(group.clone()),
+            ScopePolicy {
+                contention: ContentionMode::Queue,
+                admission: AdmissionPolicy {
+                    max_concurrency: Some(1),
+                    rate_limit: None,
+                },
+            },
+        );
+        let mut first = sub("first");
+        first.group = Some(group.clone());
+        let mut pending = sub("pending");
+        pending.group = Some(group);
+        let first = a.submit(Duration::ZERO, first);
+        let pending = a.submit(Duration::ZERO, pending);
+
+        assert_eq!(
+            a.subscribe_with_replay(pending.request_id, SubscriptionId(9), 0),
+            Some(SubscriptionReplay::Pending)
+        );
+
+        let execution = first.execution_id.unwrap();
+        let attempt = a.execution(execution).unwrap().attempts[0];
+        assert!(a.complete_attempt(Duration::ZERO, execution, attempt, Outcome::Succeeded));
+        let assigned = a
+            .execution(
+                a.requests
+                    .get(pending.request_id)
+                    .unwrap()
+                    .execution_id
+                    .unwrap(),
+            )
+            .unwrap()
+            .id;
+        assert!(matches!(
+            a.subscribe_with_replay(pending.request_id, SubscriptionId(9), 0),
+            Some(SubscriptionReplay::Execution { execution_id: id, .. }) if id == assigned
+        ));
+    }
+
+    #[test]
+    fn dropped_request_replays_a_terminal_outcome_without_an_execution() {
+        let mut a = Application::new();
+        let group = GroupId::from("g");
+        a.configure_scope(
+            PolicyScopeId::Group(group.clone()),
+            ScopePolicy {
+                contention: ContentionMode::Drop,
+                admission: AdmissionPolicy {
+                    max_concurrency: Some(1),
+                    rate_limit: None,
+                },
+            },
+        );
+        let mut first = sub("first");
+        first.group = Some(group.clone());
+        let mut dropped = sub("dropped");
+        dropped.group = Some(group);
+        a.submit(Duration::ZERO, first);
+        let dropped = a.submit(Duration::ZERO, dropped);
+
+        assert!(matches!(
+            a.subscribe_with_replay(dropped.request_id, SubscriptionId(1), 0),
+            Some(SubscriptionReplay::Terminal {
+                outcome: Outcome::Dropped { .. }
+            })
+        ));
     }
 
     #[test]
