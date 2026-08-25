@@ -21,9 +21,10 @@ use crate::protocol::{self, AcquireRequest, BrokerMessage, ClientMessage, Output
 
 const HISTORY_LINES: usize = 1_000;
 const OUTPUT_CHUNK: usize = 8 * 1024;
-// Each output event is at most about 11 KiB.  This leaves room below the
-// protocol's required 1 MiB client backlog without making output unbounded.
-const CLIENT_QUEUE: usize = 64;
+// One output frame may be in flight. Keep a second slot for the terminal exit
+// frame so it remains ordered after the final output frame.
+const CLIENT_WRITER_QUEUE: usize = 2;
+const CLIENT_BACKLOG_BYTES: usize = protocol::MAX_FRAME_SIZE;
 
 type ClientId = u64;
 
@@ -58,10 +59,174 @@ struct Client {
     close: mpsc::UnboundedSender<()>,
 }
 
+#[derive(Clone)]
+struct OutputChunk {
+    message: BrokerMessage,
+    wire_bytes: usize,
+}
+
+impl OutputChunk {
+    fn new(stream: OutputStream, data: &[u8]) -> Self {
+        let message = BrokerMessage::output(stream, data);
+        let wire_bytes = serde_json::to_vec(&message)
+            .expect("output messages always serialize")
+            .len()
+            + std::mem::size_of::<u32>();
+        Self {
+            message,
+            wire_bytes,
+        }
+    }
+}
+
+struct ByteQueue {
+    messages: VecDeque<OutputChunk>,
+    wire_bytes: usize,
+}
+
+impl ByteQueue {
+    fn new() -> Self {
+        Self {
+            messages: VecDeque::new(),
+            wire_bytes: 0,
+        }
+    }
+
+    fn push(&mut self, message: OutputChunk, in_flight_bytes: usize) -> bool {
+        let Some(total) = self
+            .wire_bytes
+            .checked_add(in_flight_bytes)
+            .and_then(|bytes| bytes.checked_add(message.wire_bytes))
+        else {
+            return false;
+        };
+        if total > CLIENT_BACKLOG_BYTES {
+            return false;
+        }
+        self.wire_bytes += message.wire_bytes;
+        self.messages.push_back(message);
+        true
+    }
+
+    fn pop(&mut self) -> Option<OutputChunk> {
+        let message = self.messages.pop_front()?;
+        self.wire_bytes -= message.wire_bytes;
+        Some(message)
+    }
+}
+
+struct Replay {
+    lines: VecDeque<HistoryLine>,
+    offset: usize,
+}
+
+impl Replay {
+    fn new(lines: VecDeque<HistoryLine>) -> Self {
+        Self { lines, offset: 0 }
+    }
+
+    fn next(&mut self) -> Option<OutputChunk> {
+        let line = self.lines.front()?;
+        let end = (self.offset + OUTPUT_CHUNK).min(line.data.len());
+        let chunk = OutputChunk::new(line.stream, &line.data[self.offset..end]);
+        if end == line.data.len() {
+            self.lines.pop_front();
+            self.offset = 0;
+        } else {
+            self.offset = end;
+        }
+        Some(chunk)
+    }
+}
+
+enum DeliveryState {
+    Replaying { replay: Replay, pending: ByteQueue },
+    Live { pending: ByteQueue },
+}
+
+struct Delivery {
+    client: Client,
+    state: DeliveryState,
+    writer_ready: bool,
+    in_flight_bytes: usize,
+}
+
+impl Delivery {
+    fn replaying(client: Client, lines: VecDeque<HistoryLine>) -> Self {
+        Self {
+            client,
+            state: DeliveryState::Replaying {
+                replay: Replay::new(lines),
+                pending: ByteQueue::new(),
+            },
+            writer_ready: false,
+            in_flight_bytes: 0,
+        }
+    }
+
+    fn live(client: Client) -> Self {
+        Self {
+            client,
+            state: DeliveryState::Live {
+                pending: ByteQueue::new(),
+            },
+            writer_ready: false,
+            in_flight_bytes: 0,
+        }
+    }
+
+    fn enqueue(&mut self, message: OutputChunk) -> bool {
+        let pending = match &mut self.state {
+            DeliveryState::Replaying { pending, .. } | DeliveryState::Live { pending } => pending,
+        };
+        pending.push(message, self.in_flight_bytes)
+    }
+
+    fn writer_ready(&mut self) -> bool {
+        self.writer_ready = true;
+        self.in_flight_bytes = 0;
+        self.deliver_next()
+    }
+
+    fn deliver_next(&mut self) -> bool {
+        if !self.writer_ready {
+            return true;
+        }
+        let message = loop {
+            match &mut self.state {
+                DeliveryState::Replaying { replay, .. } => {
+                    if let Some(message) = replay.next() {
+                        break Some(message);
+                    }
+                    let DeliveryState::Replaying { pending, .. } = std::mem::replace(
+                        &mut self.state,
+                        DeliveryState::Live {
+                            pending: ByteQueue::new(),
+                        },
+                    ) else {
+                        unreachable!("state was checked above");
+                    };
+                    self.state = DeliveryState::Live { pending };
+                }
+                DeliveryState::Live { pending } => break pending.pop(),
+            }
+        };
+        let Some(message) = message else {
+            return true;
+        };
+        if !send(&self.client, message.message.clone()) {
+            return false;
+        }
+        self.writer_ready = false;
+        self.in_flight_bytes = message.wire_bytes;
+        true
+    }
+}
+
 struct ProcessRecord {
     timeout: Duration,
     process_group: i32,
-    clients: HashMap<ClientId, Client>,
+    clients: HashMap<ClientId, Delivery>,
     history: VecDeque<HistoryLine>,
     partial_stdout: Vec<u8>,
     partial_stderr: Vec<u8>,
@@ -98,6 +263,9 @@ enum Event {
         key: ProcessKey,
         generation: u64,
     },
+    WriterReady {
+        client_id: ClientId,
+    },
     ConnectionClosed,
 }
 
@@ -108,6 +276,7 @@ pub async fn run(socket: PathBuf) -> Result<()> {
     let (events, mut receiver) = mpsc::channel(256);
     let events = Arc::new(events);
     let mut records = HashMap::<ProcessKey, ProcessRecord>::new();
+    let mut client_keys = HashMap::<ClientId, ProcessKey>::new();
     let mut next_client = 1_u64;
     let mut connections = 0_usize;
     // The launching client connects only after this process has bound its
@@ -134,7 +303,7 @@ pub async fn run(socket: PathBuf) -> Result<()> {
             },
             event = receiver.recv() => match event {
                 Some(Event::ConnectionClosed) => connections = connections.saturating_sub(1),
-                Some(event) => handle_event(event, &mut records, &events).await,
+                Some(event) => handle_event(event, &mut records, &mut client_keys, &events).await,
                 None => break,
             },
             _ = interrupt.recv() => break,
@@ -159,9 +328,10 @@ async fn handle_connection(
     events: Arc<mpsc::Sender<Event>>,
 ) {
     let (mut reader, mut writer) = stream.into_split();
-    let (messages, mut outbound) = mpsc::channel(CLIENT_QUEUE);
+    let (messages, mut outbound) = mpsc::channel(CLIENT_WRITER_QUEUE);
     let (close, mut close_rx) = mpsc::unbounded_channel();
     let (writer_closed, mut writer_closed_rx) = oneshot::channel();
+    let writer_events = Arc::clone(&events);
     tokio::spawn(async move {
         while let Some(message) = outbound.recv().await {
             if protocol::write_message(&mut writer, &message)
@@ -174,6 +344,13 @@ async fn handle_connection(
                 message,
                 BrokerMessage::Exit { .. } | BrokerMessage::Error { .. }
             ) {
+                break;
+            }
+            if writer_events
+                .send(Event::WriterReady { client_id })
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -273,6 +450,7 @@ async fn handle_connection(
 async fn handle_event(
     event: Event,
     records: &mut HashMap<ProcessKey, ProcessRecord>,
+    client_keys: &mut HashMap<ClientId, ProcessKey>,
     events: &mpsc::Sender<Event>,
 ) {
     match event {
@@ -290,7 +468,7 @@ async fn handle_event(
             };
             if let Some(record) = records.get_mut(&key) {
                 record.timeout = Duration::from_millis(request.broker_timeout_ms);
-                let tail: Vec<_> = record
+                let tail = record
                     .history
                     .iter()
                     .skip(
@@ -300,23 +478,18 @@ async fn handle_event(
                             .saturating_sub(request.tail_lines.min(HISTORY_LINES)),
                     )
                     .cloned()
-                    .collect();
+                    .collect::<VecDeque<_>>();
                 if !send(&client, BrokerMessage::Attached { reused: true }) {
                     let _ = response.send(Err("client disconnected while attaching".into()));
                     return;
                 }
-                for line in tail {
-                    if !send_history_line(&client, line.stream, &line.data) {
-                        let _ = response.send(Err(
-                            "client output queue filled while replaying history".into(),
-                        ));
-                        return;
-                    }
-                }
-                // A successful lease invalidates a previously armed idle
-                // timer. Do this only after its replay has fit the queue.
+                // Attached is in flight. Its writer acknowledgement starts
+                // replay, so live output cannot overtake the requested tail.
                 record.idle_generation = record.idle_generation.wrapping_add(1);
-                record.clients.insert(client.id, client);
+                client_keys.insert(client.id, key.clone());
+                record
+                    .clients
+                    .insert(client.id, Delivery::replaying(client, tail));
                 let _ = response.send(Ok(()));
                 return;
             }
@@ -329,7 +502,8 @@ async fn handle_event(
                         return;
                     }
                     let mut clients = HashMap::new();
-                    clients.insert(client.id, client);
+                    client_keys.insert(client.id, key.clone());
+                    clients.insert(client.id, Delivery::live(client));
                     records.insert(
                         key,
                         ProcessRecord {
@@ -355,6 +529,7 @@ async fn handle_event(
             let Some(record) = records.get_mut(&key) else {
                 return;
             };
+            client_keys.remove(&client_id);
             if record.clients.remove(&client_id).is_some() && record.clients.is_empty() {
                 arm_idle(key, record, events.clone());
             }
@@ -365,14 +540,18 @@ async fn handle_event(
             };
             let had_clients = !record.clients.is_empty();
             append_history(record, stream, &data);
+            let output = OutputChunk::new(stream, &data);
             let stale: Vec<_> = record
                 .clients
-                .iter()
-                .filter_map(|(&id, client)| (!send_output(client, stream, &data)).then_some(id))
+                .iter_mut()
+                .filter_map(|(&id, delivery)| {
+                    (!delivery.enqueue(output.clone()) || !delivery.deliver_next()).then_some(id)
+                })
                 .collect();
             for id in stale {
-                if let Some(client) = record.clients.remove(&id) {
-                    close_client(&client);
+                if let Some(delivery) = record.clients.remove(&id) {
+                    client_keys.remove(&id);
+                    close_client(&delivery.client);
                 }
             }
             if had_clients && record.clients.is_empty() {
@@ -381,9 +560,10 @@ async fn handle_event(
         }
         Event::Exited { key, code, signal } => {
             if let Some(record) = records.remove(&key) {
-                for client in record.clients.values() {
-                    if !send(client, BrokerMessage::Exit { code, signal }) {
-                        close_client(client);
+                for (id, delivery) in record.clients {
+                    client_keys.remove(&id);
+                    if !send(&delivery.client, BrokerMessage::Exit { code, signal }) {
+                        close_client(&delivery.client);
                     }
                 }
             }
@@ -396,6 +576,27 @@ async fn handle_event(
                 tokio::spawn(terminate_process_group(record.process_group));
             }
         }
+        Event::WriterReady { client_id } => {
+            let Some(key) = client_keys.get(&client_id).cloned() else {
+                return;
+            };
+            let Some(record) = records.get_mut(&key) else {
+                return;
+            };
+            let stale = record
+                .clients
+                .get_mut(&client_id)
+                .is_some_and(|delivery| !delivery.writer_ready());
+            if stale {
+                if let Some(delivery) = record.clients.remove(&client_id) {
+                    client_keys.remove(&client_id);
+                    close_client(&delivery.client);
+                }
+                if record.clients.is_empty() {
+                    arm_idle(key, record, events.clone());
+                }
+            }
+        }
         Event::ConnectionClosed => unreachable!("handled by broker loop"),
     }
 }
@@ -406,17 +607,6 @@ fn send(client: &Client, message: BrokerMessage) -> bool {
 
 fn close_client(client: &Client) {
     let _ = client.close.send(());
-}
-fn send_output(client: &Client, stream: OutputStream, data: &[u8]) -> bool {
-    send(client, BrokerMessage::output(stream, data))
-}
-
-fn send_history_line(client: &Client, stream: OutputStream, data: &[u8]) -> bool {
-    // A line can be larger than either our read buffer or the wire-frame cap.
-    // Replaying it in chunks preserves its bytes and avoids creating an
-    // unwriteable JSON frame.
-    data.chunks(OUTPUT_CHUNK)
-        .all(|chunk| send_output(client, stream, chunk))
 }
 
 fn arm_idle(key: ProcessKey, record: &mut ProcessRecord, events: mpsc::Sender<Event>) {
@@ -555,5 +745,93 @@ async fn terminate_all(process_groups: impl Iterator<Item = i32>) {
     tokio::time::sleep(Duration::from_secs(1)).await;
     for process_group in process_groups {
         signal_process_group(process_group, libc::SIGKILL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn replays_more_chunks_than_the_writer_queue() {
+        let (messages, mut outbound) = mpsc::channel(CLIENT_WRITER_QUEUE);
+        let (close, _) = mpsc::unbounded_channel();
+        let chunks = 65;
+        let lines = (0..chunks)
+            .map(|_| HistoryLine {
+                stream: OutputStream::Stdout,
+                data: vec![b'x'; OUTPUT_CHUNK],
+            })
+            .collect();
+        let mut delivery = Delivery::replaying(
+            Client {
+                id: 1,
+                messages,
+                close,
+            },
+            lines,
+        );
+
+        for _ in 0..chunks {
+            assert!(delivery.writer_ready());
+            assert!(matches!(
+                outbound.recv().await,
+                Some(BrokerMessage::Output { .. })
+            ));
+        }
+        assert!(delivery.writer_ready());
+        assert!(outbound.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn delivers_live_output_after_replay() {
+        let (messages, mut outbound) = mpsc::channel(CLIENT_WRITER_QUEUE);
+        let (close, _) = mpsc::unbounded_channel();
+        let mut delivery = Delivery::replaying(
+            Client {
+                id: 1,
+                messages,
+                close,
+            },
+            VecDeque::from([HistoryLine {
+                stream: OutputStream::Stdout,
+                data: b"history\n".to_vec(),
+            }]),
+        );
+        assert!(delivery.enqueue(OutputChunk::new(OutputStream::Stdout, b"live\n")));
+
+        assert!(delivery.writer_ready());
+        let BrokerMessage::Output { data_base64, .. } = outbound.recv().await.unwrap() else {
+            panic!("expected replay output");
+        };
+        assert_eq!(protocol::decode_output(&data_base64).unwrap(), b"history\n");
+
+        assert!(delivery.writer_ready());
+        let BrokerMessage::Output { data_base64, .. } = outbound.recv().await.unwrap() else {
+            panic!("expected live output");
+        };
+        assert_eq!(protocol::decode_output(&data_base64).unwrap(), b"live\n");
+    }
+
+    #[test]
+    fn bounds_pending_live_output_by_wire_bytes() {
+        let (messages, _) = mpsc::channel(CLIENT_WRITER_QUEUE);
+        let (close, _) = mpsc::unbounded_channel();
+        let mut delivery = Delivery::live(Client {
+            id: 1,
+            messages,
+            close,
+        });
+        let output = OutputChunk::new(OutputStream::Stdout, &vec![b'x'; OUTPUT_CHUNK]);
+
+        while delivery.enqueue(output.clone()) {}
+
+        let pending_bytes = match &delivery.state {
+            DeliveryState::Live { pending } | DeliveryState::Replaying { pending, .. } => {
+                pending.wire_bytes
+            }
+        };
+        assert!(pending_bytes <= CLIENT_BACKLOG_BYTES);
+        assert!(!delivery.enqueue(output));
     }
 }
