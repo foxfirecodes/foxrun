@@ -8,12 +8,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use fs2::FileExt;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::time::{Instant, sleep};
 
 use crate::protocol::{
-    BrokerMessage, ClientMessage, OutputStream, decode_output, read_frame, write_frame,
+    BrokerMessage, ClientMessage, OutputStream, ProtocolError, decode_output, read_frame,
+    write_frame,
 };
 
 const STARTUP_DEADLINE: Duration = Duration::from_secs(2);
@@ -32,26 +33,71 @@ pub async fn run(options: ClientOptions) -> Result<()> {
     let runtime_dir = runtime_dir()?;
     let socket = runtime_dir.join("broker.sock");
     check_socket_path(&socket)?;
-    let mut stream = connect_or_start(&runtime_dir, &socket).await?;
-
     let broker_timeout_ms = options
         .broker_timeout
         .as_millis()
         .try_into()
         .map_err(|_| anyhow!("--broker-timeout is too large"))?;
-    write_frame(
-        &mut stream,
-        &ClientMessage::Acquire {
-            cwd: cwd.to_string_lossy().into_owned(),
-            argv: options.argv,
-            tail_lines: options.tail_lines,
-            broker_timeout_ms,
-        },
-    )
-    .await
-    .context("could not send acquire request")?;
+    let acquire = ClientMessage::Acquire {
+        cwd: cwd.to_string_lossy().into_owned(),
+        argv: options.argv,
+        tail_lines: options.tail_lines,
+        broker_timeout_ms,
+    };
+    let deadline = Instant::now() + STARTUP_DEADLINE;
+    let mut last_error = None;
 
-    stream_messages(&mut stream).await
+    loop {
+        let mut stream = connect_or_start(&runtime_dir, &socket).await?;
+        match send_acquire_and_wait_for_attach(&mut stream, &acquire).await? {
+            AcquireResult::Attached => return stream_messages(&mut stream).await,
+            AcquireResult::ConnectionClosed(error) => {
+                last_error = Some(error);
+                if Instant::now() >= deadline {
+                    bail!(
+                        "broker did not accept acquire within {}: {}",
+                        humantime::format_duration(STARTUP_DEADLINE),
+                        last_error.expect("connection error was recorded")
+                    );
+                }
+                sleep(RETRY_DELAY).await;
+            }
+        }
+    }
+}
+
+enum AcquireResult {
+    Attached,
+    /// The broker can close a just-established connection while it exits. No
+    /// acquire was acknowledged, so it is safe to connect again.
+    ConnectionClosed(ProtocolError),
+}
+
+async fn send_acquire_and_wait_for_attach<S>(
+    stream: &mut S,
+    acquire: &ClientMessage,
+) -> Result<AcquireResult>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if let Err(error) = write_frame(stream, acquire).await {
+        return match error {
+            ProtocolError::Io(error) => {
+                Ok(AcquireResult::ConnectionClosed(ProtocolError::Io(error)))
+            }
+            error => Err(error).context("could not send acquire request"),
+        };
+    }
+
+    match read_frame::<_, BrokerMessage>(stream).await {
+        Ok(BrokerMessage::Attached { .. }) => Ok(AcquireResult::Attached),
+        Ok(BrokerMessage::Error { message }) => bail!("broker: {message}"),
+        Ok(message) => bail!("broker sent {message:?} before attached"),
+        Err(ProtocolError::Io(error)) => {
+            Ok(AcquireResult::ConnectionClosed(ProtocolError::Io(error)))
+        }
+        Err(error) => Err(error).context("broker sent an invalid response"),
+    }
 }
 
 fn canonical_directory(input: Option<&Path>) -> Result<PathBuf> {
@@ -251,6 +297,7 @@ async fn stream_messages(stream: &mut UnixStream) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::duplex;
 
     #[test]
     fn rejects_non_directory() {
@@ -265,5 +312,27 @@ mod tests {
         std::fs::File::create(&path).unwrap();
         assert!(remove_stale_socket(&path).is_err());
         assert!(path.exists());
+    }
+
+    #[tokio::test]
+    async fn retries_when_broker_closes_before_attaching() {
+        let (mut stream, mut broker) = duplex(4096);
+        let server = tokio::spawn(async move {
+            let _: ClientMessage = read_frame(&mut broker).await.unwrap();
+        });
+        let acquire = ClientMessage::Acquire {
+            cwd: "/tmp".into(),
+            argv: vec!["command".into()],
+            tail_lines: 0,
+            broker_timeout_ms: 1,
+        };
+
+        assert!(matches!(
+            send_acquire_and_wait_for_attach(&mut stream, &acquire)
+                .await
+                .unwrap(),
+            AcquireResult::ConnectionClosed(ProtocolError::Io(_))
+        ));
+        server.await.unwrap();
     }
 }
